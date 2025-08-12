@@ -7,7 +7,7 @@ def convert_meters_to_pixel_distance(meters, refrence_height_in_meters, refrence
     return (meters * refrence_height_in_pixels) / refrence_height_in_meters
 
 def frame_to_time(frame, fps):
-    return frame / fps
+    return int(frame) / int(fps)
 
 def convert_detections_to_mini_court_coordinates(
         mini_court,

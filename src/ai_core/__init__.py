@@ -8,10 +8,11 @@ from .tracknet_ball_tracker import TrackNetBallTracker
 from .court_line_detector import CourtLineDetector
 from .letr_court_line_detector import LETRCourtDetector
 from .racket_player_ball_detector import RacketPlayerBallDetector
+from .shot_type_classifier import ShotTypeClassifier
 
-__all__ = ["PlayerTracker", "CourtLineDetector", "BallBounceModel", "MiniCourt", "TrackNetBallTracker", "LETRCourtDetector", "RacketPlayerBallDetector"]
+__all__ = ["PlayerTracker", "CourtLineDetector", "BallBounceModel", "MiniCourt", "TrackNetBallTracker", "LETRCourtDetector", "RacketPlayerBallDetector", "ShotTypeClassifier"]
 
-def initialize_models(player_tracker_model_path, court_line_detector_model_path, letr_court_line_detector_model_path, ball_bounce_model_path, scoreboard_model_path, tracknet_ball_tracker_model_path, racket_player_ball_detector_model_path):
+def initialize_models(player_tracker_model_path, court_line_detector_model_path, letr_court_line_detector_model_path, ball_bounce_model_path, scoreboard_model_path, tracknet_ball_tracker_model_path, racket_player_ball_detector_model_path, shot_type_classifier_model_path, movenet_pose_extractor_model_path):
     # Import here to avoid circular import
     from schemas.ai import AIModels
     
@@ -54,7 +55,7 @@ def initialize_models(player_tracker_model_path, court_line_detector_model_path,
     ball_bounce_model = BallBounceModel(model_path=ball_bounce_model_path, device=device, window_size=10)
     mini_court = MiniCourt(output_width=1280, output_height=720)
     scoreboard_model = Scoreboard(model_path=scoreboard_model_path, device=device)
-
+    shot_type_classifier = ShotTypeClassifier(model_path=shot_type_classifier_model_path, device=device, pose_extractor_model_path=movenet_pose_extractor_model_path)
     return AIModels(
         player_tracker=player_tracker,
         tracknet_ball_tracker=tracknet_ball_tracker,
@@ -63,5 +64,6 @@ def initialize_models(player_tracker_model_path, court_line_detector_model_path,
         letr_court_line_detector=letr_court_line_detector,
         ball_bounce_model=ball_bounce_model,
         mini_court=mini_court,
-        scoreboard_model=scoreboard_model
+        scoreboard_model=scoreboard_model,
+        shot_type_classifier=shot_type_classifier
         )

@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from utils.conversions import frame_to_time
 
 class ShotCounter:
     """
@@ -57,6 +58,16 @@ class ShotCounter:
             self.results.append({"FrameID": frame_id, "Shot": self.last_shot})
 
         self.frames_since_last_shot += 1
+
+    def format_results(self, fps):
+        formatted_results = []
+        for result in self.results:
+            formatted_results.append({
+                "index": result["FrameID"],
+                "time": frame_to_time(result["FrameID"], fps),
+                "shot_type": result["Shot"],
+            })
+        return formatted_results
 
     def display(self, frame):
         """Display counter"""

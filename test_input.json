@@ -1,0 +1,16 @@
+{
+  "input": {
+    "route": "analysis/process_video",
+    "data": {
+      "video_url": "https://huggingface.co/AmNat789/CovSports/resolve/main/short_clip.mp4",
+      "video_id": "1",
+      "features": [
+        "DeadTimeDetection",
+        "MatchSectioning",
+        "TrackBallSpeed",
+        "TrackPlayerSpeed",
+        "ClassifyShotType"
+      ]
+    }
+  }
+}
