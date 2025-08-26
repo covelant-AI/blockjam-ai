@@ -2,6 +2,18 @@ import pandas as pd
 from ai_core.mini_court import MiniCourt
 import numpy as np
 
+def smooth_speed_data(speeds:list[float], window_size=3, alpha=0.3):
+    df = pd.DataFrame(speeds, columns=['speed'])
+    df['smooth_speed'] = (
+        df['speed']
+        .rolling(window=window_size, center=True, min_periods=1)
+        .mean()
+        .fillna(method='bfill')
+        .fillna(method='ffill')
+    )
+    df['smooth_speed'] = df['smooth_speed'].ewm(alpha=alpha, adjust=False).mean()
+    return df['smooth_speed'].tolist()
+
 def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_kmh):
     """
     Generic function to calculate speed data from detections.

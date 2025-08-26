@@ -9,10 +9,11 @@ from .court_line_detector import CourtLineDetector
 from .letr_court_line_detector import LETRCourtDetector
 from .racket_player_ball_detector import RacketPlayerBallDetector
 from .shot_type_classifier import ShotTypeClassifier
+from .ball_tracker import BallTracker
 
-__all__ = ["PlayerTracker", "CourtLineDetector", "BallBounceModel", "MiniCourt", "TrackNetBallTracker", "LETRCourtDetector", "RacketPlayerBallDetector", "ShotTypeClassifier"]
+__all__ = ["PlayerTracker", "CourtLineDetector", "BallBounceModel", "MiniCourt", "BallTracker", "LETRCourtDetector", "RacketPlayerBallDetector", "ShotTypeClassifier"]
 
-def initialize_models(player_tracker_model_path, court_line_detector_model_path, letr_court_line_detector_model_path, ball_bounce_model_path, scoreboard_model_path, tracknet_ball_tracker_model_path, racket_player_ball_detector_model_path, shot_type_classifier_model_path, movenet_pose_extractor_model_path):
+def initialize_models(player_tracker_model_path, court_line_detector_model_path, letr_court_line_detector_model_path, ball_bounce_model_path, scoreboard_model_path, ball_tracker_model_path, racket_player_ball_detector_model_path, shot_type_classifier_model_path, movenet_pose_extractor_model_path):
     # Import here to avoid circular import
     from schemas.ai import AIModels
     
@@ -48,7 +49,7 @@ def initialize_models(player_tracker_model_path, court_line_detector_model_path,
         raise Exception(error_msg)
 
     player_tracker = PlayerTracker(model_path=player_tracker_model_path, device=device)
-    tracknet_ball_tracker = TrackNetBallTracker(model_path=tracknet_ball_tracker_model_path, device=device)
+    ball_tracker = BallTracker(model_path=ball_tracker_model_path, device=device)
     racket_player_ball_detector = RacketPlayerBallDetector(model_path=racket_player_ball_detector_model_path, device=device)
     court_line_detector = CourtLineDetector(court_line_detector_model_path, device=device)
     letr_court_line_detector = LETRCourtDetector(letr_court_line_detector_model_path, device=device)
@@ -58,7 +59,7 @@ def initialize_models(player_tracker_model_path, court_line_detector_model_path,
     shot_type_classifier = ShotTypeClassifier(model_path=shot_type_classifier_model_path, device=device, pose_extractor_model_path=movenet_pose_extractor_model_path)
     return AIModels(
         player_tracker=player_tracker,
-        tracknet_ball_tracker=tracknet_ball_tracker,
+        ball_tracker=ball_tracker,
         racket_player_ball_detector=racket_player_ball_detector,
         court_line_detector=court_line_detector,
         letr_court_line_detector=letr_court_line_detector,

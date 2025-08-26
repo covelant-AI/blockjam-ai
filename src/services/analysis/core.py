@@ -9,7 +9,7 @@ from .court_keypoints import court_keypoints_by_time_step, get_keypoint_closest_
 from utils.simple import find_object_by_key_value
 from ai_core.racket_player_ball_detector import RacketPlayerBallDetector
 from ai_core.player_tracker import PlayerTracker
-from ai_core.tracknet_ball_tracker import TrackNetBallTracker
+from ai_core.ball_tracker import BallTracker
 from ai_core.court_line_detector import CourtLineDetector
 from ai_core.letr_court_line_detector import LETRCourtDetector
 from ai_core.ball_bounce_model import BallBounceModel
@@ -27,7 +27,7 @@ def analyze_video(
         video_path,
         features: List[Feature],  
         player_tracker: PlayerTracker,
-        tracknet_ball_tracker: TrackNetBallTracker,
+        ball_tracker: BallTracker,
         racket_player_ball_detector: RacketPlayerBallDetector,
         court_line_detector: CourtLineDetector,
         letr_court_line_detector: LETRCourtDetector,
@@ -43,12 +43,12 @@ def analyze_video(
     video_info = get_video_info(video_path)
     timing_results = {}
 
-    active_sequences = []
-    if Feature.DEAD_TIME_DETECTION in features:
-    # Step 2: Deadtime removal
-        start_time = time.time()
-        active_sequences = deadtime_removal(video_id, video_path, racket_player_ball_detector, step_time=2, deadtime_min_seconds=10, non_deadtime_min_seconds=10, make_request=make_request)
-        timing_results['deadtime_removal'] = time.time() - start_time
+    # active_sequences = []
+    # if Feature.DEAD_TIME_DETECTION in features:
+    # # Step 2: Deadtime removal
+    #     start_time = time.time()
+    #     active_sequences = deadtime_removal(video_id, video_path, racket_player_ball_detector, step_time=2, deadtime_min_seconds=10, non_deadtime_min_seconds=10, make_request=make_request)
+    #     timing_results['deadtime_removal'] = time.time() - start_time
 
     sections = []
     ball_detections_for_sections = []
@@ -60,7 +60,7 @@ def analyze_video(
 
         # Step 3: Ball-based sectioning
         start_time = time.time()
-        sections, ball_detections_for_sections = ball_based_sectioning(video_id, video_path, tracknet_ball_tracker, active_sequences, chunk_size=chunk_size, video_info=video_info, make_video_info_request=make_request, make_sections_request=make_request, make_ball_detections_request=False, read_from_stub=False, save_to_stub=save_to_stub) #TODO: Make Request when Next Server is ready
+        sections, ball_detections_for_sections, ball_speeds = ball_based_sectioning(video_id, video_path, ball_tracker, all_court_keypoints, chunk_size=chunk_size, video_info=video_info, make_video_info_request=make_request, make_sections_request=make_request, make_ball_detections_request=False, read_from_stub=False, save_to_stub=save_to_stub) #TODO: Make Request when Next Server is ready
         timing_results['ball_based_sectioning'] = time.time() - start_time
 
     player_detections_for_sections = []

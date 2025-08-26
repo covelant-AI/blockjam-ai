@@ -35,7 +35,7 @@ def handle_process_video(event, ai_models: AIModels):
             features= [Feature(feature) for feature in data['features']],
             video_path=video_path,
             player_tracker=ai_models.player_tracker,
-            tracknet_ball_tracker=ai_models.tracknet_ball_tracker,
+            ball_tracker=ai_models.ball_tracker,
             racket_player_ball_detector=ai_models.racket_player_ball_detector,
             court_line_detector=ai_models.court_line_detector,
             letr_court_line_detector=ai_models.letr_court_line_detector,
