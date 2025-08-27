@@ -24,15 +24,9 @@ def handler(job):
     models_path = os.path.join(root_dir, models_path)
     
     ai_models = ai_core.initialize_models(
-    player_tracker_model_path=os.path.join(models_path, "yolo11s.pt"),
-    court_line_detector_model_path=os.path.join(models_path, "model_tennis_court_det.pt"),
-    letr_court_line_detector_model_path=os.path.join(models_path, "letr_best_checkpoint.pth"),
-    ball_bounce_model_path=os.path.join(models_path, "bounce_detection_model_dict_w10.pth"),
-    scoreboard_model_path=os.path.join(models_path, "scoreboard_yolov8s_best.pt"),
-    ball_tracker_model_path=os.path.join(models_path, "yolo_ball_tracker_best.pt"),
-    racket_player_ball_detector_model_path=os.path.join(models_path, "racket_player_ball_yolo11n.pt"),
-    shot_type_classifier_model_path=os.path.join(models_path, "tennis_rnn_rafa.pth"),
-    movenet_pose_extractor_model_path=os.path.join(models_path, "movenet.tflite")
+        ball_and_player_tracker_model_path=os.path.join(models_path, "yolo_ball_and_player_best.pt"),
+        court_line_detector_model_path=os.path.join(models_path, "model_tennis_court_det.pt"),
+        letr_court_line_detector_model_path=os.path.join(models_path, "letr_best_checkpoint.pth"),
     )
 
     if route[0] == 'analysis':

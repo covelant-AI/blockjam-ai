@@ -2,7 +2,7 @@ import pandas as pd
 from ai_core.mini_court import MiniCourt
 import numpy as np
 
-def smooth_speed_data(speeds:list[float], window_size=3, alpha=0.3):
+def smooth_speed_data(speeds:list[float], window_size=3, alpha=0.3, fps=30, time_step=0.25):
     df = pd.DataFrame(speeds, columns=['speed'])
     df['smooth_speed'] = (
         df['speed']
@@ -12,7 +12,7 @@ def smooth_speed_data(speeds:list[float], window_size=3, alpha=0.3):
         .fillna(method='ffill')
     )
     df['smooth_speed'] = df['smooth_speed'].ewm(alpha=alpha, adjust=False).mean()
-    return df['smooth_speed'].tolist()
+    return  df[df.index % (fps * time_step) == 0]['smooth_speed'].tolist()
 
 def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_kmh):
     """

@@ -16,7 +16,7 @@ def get_sections_fram_ball_detections(
         min_section_time=1.5,
         section_null_threshold=0.5,
         min_time_between_sections=1,
-        buffer_time_before_section=3,
+        buffer_time_before_section=2,
         buffer_time_after_section=1,
         max_gap_time=1,
         min_ball_speed_kmh=20,

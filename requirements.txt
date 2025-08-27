@@ -1,6 +1,7 @@
 numpy>=1.24.0
 opencv-python>=4.8.0
-ultralytics>=8.3
+ultralytics==8.3.170
+ultralytics-thop==2.0.14
 torch==2.5.1
 torchvision>=0.15.0
 pytest>=8.0.0
