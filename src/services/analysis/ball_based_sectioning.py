@@ -1,25 +1,16 @@
-from utils.video_utils import total_chunks, read_video_chunk, get_video_info
-import requests
-import os
-from utils.stubs import load_detections_from_stub, save_detections_to_stub
-from utils.bbox_utils import measure_distance
-import time
 from utils.conversions import frame_to_time
-from services.analysis.ball_stubs import ball_stubs_for_whole_video
-from ai_core.ball_tracker import BallTracker
-import numpy as np
 
 def get_sections_fram_ball_detections(
         ball_detections,
         ball_speeds, 
         video_info,
         min_section_time=1.5,
-        section_null_threshold=0.5,
+        section_null_threshold=0.75,
         min_time_between_sections=1,
         buffer_time_before_section=2,
         buffer_time_after_section=1,
         max_gap_time=1,
-        min_ball_speed_kmh=20,
+        min_ball_speed_kmh=5,
         ):
     print(f"Getting sections from ball detections")
     max_gap_size = max_gap_time * video_info['fps']
@@ -97,79 +88,3 @@ def combine_ball_detections_sections(ball_detections_sections, video_info):
     if ball_detections_sections[-1]['section']['end']['index'] < video_info['total_frames']:
         ball_detections.extend((None, None) for _ in range(int(video_info['total_frames'] - ball_detections_sections[-1]['section']['end']['index'])))
     return ball_detections
-
-def ball_based_sectioning(
-        video_id,
-        video_path,
-        ball_tracker: BallTracker,
-        all_court_keypoints: list[dict],
-        video_info=None,
-        chunk_size=1000, 
-        make_video_info_request=False,
-        make_sections_request=False,
-        make_ball_detections_request=False,
-        read_from_stub=False,
-        save_to_stub=False,
-        video_info_webhook_path='/ai_analysis/video_info',
-        sections_webhook_path='/ai_analysis/sections',
-        ball_detections_webhook_path='/ai_analysis/ball_detections',
-        ball_detections_stub_path='tracker_stubs/ball_detections_sections.pkl',
-        sections_stub_path='tracker_stubs/sections.pkl'
-        ):
-    print("Starting ball based sectioning")
-
-    # Get video_info if not provided
-    if video_info is None:
-        video_info = get_video_info(video_path)
-
-    if read_from_stub:
-        sections = load_detections_from_stub(sections_stub_path)
-        ball_detections_for_sections = load_detections_from_stub(ball_detections_stub_path)
-    else:
-        ball_detections, ball_speeds = ball_stubs_for_whole_video(video_id, video_path, ball_tracker, all_court_keypoints, video_info=video_info)
-        sections = get_sections_fram_ball_detections(ball_detections, ball_speeds, video_info)
-        
-        ball_detections_for_sections = []
-        for section in sections:
-            stub = ball_detections[section['start']['index']:section['end']['index']]
-            ball_detections_for_sections.append({
-                'section': section,
-                'data': stub
-            })
-
-    if save_to_stub:
-        save_detections_to_stub(sections, sections_stub_path)
-        save_detections_to_stub(ball_detections_for_sections, ball_detections_stub_path)
-        print(f"Saved detections to stubs")
-
-    if make_video_info_request:
-        print(f"Making video info request")
-        base_url = os.getenv('BACKEND_URL')
-        video_info_request = requests.post(base_url+video_info_webhook_path, json={
-            'video_id': video_id,
-            'data': video_info
-        })
-        if video_info_request.status_code != 200:
-            raise Exception(f"Failed to make request 'video_info': {video_info_request.text}")
-
-    if make_sections_request:
-        print(f"Making sections request")
-        base_url = os.getenv('BACKEND_URL')
-        section_response = requests.post(base_url+sections_webhook_path, json={
-            'video_id': video_id,
-            'data': sections,
-        })
-        if section_response.status_code != 200:
-            raise Exception(f"Failed to make request 'sections': {section_response.text}")
-
-    if make_ball_detections_request:
-        print(f"Making ball detections request")
-        base_url = os.getenv('BACKEND_URL')
-        ball_detections_for_sections_response = requests.post(base_url+ball_detections_webhook_path, json={
-            'video_id': video_id,
-            'data': ball_detections_for_sections
-        })
-        if ball_detections_for_sections_response.status_code != 200:
-            raise Exception(f"Failed to make request 'ball_detections_for_sections': {ball_detections_for_sections_response.text}")
-
-    return sections, ball_detections_for_sections, ball_speeds

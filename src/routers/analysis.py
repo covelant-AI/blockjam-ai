@@ -26,7 +26,6 @@ def handle_process_video(event, ai_models: AIModels):
             ball_and_player_tracker=ai_models.ball_and_player_tracker,
             court_line_detector=ai_models.court_line_detector,
             letr_court_line_detector=ai_models.letr_court_line_detector,
-            chunk_size=1000, 
         )
 
         return {"message": "Video processed successfully", "timing_results": timing_results}
