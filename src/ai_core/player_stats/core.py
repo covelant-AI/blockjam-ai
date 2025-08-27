@@ -2,18 +2,6 @@ import pandas as pd
 from ai_core.mini_court import MiniCourt
 import numpy as np
 
-def smooth_speed_data(speeds:list[float], window_size=3, alpha=0.3, fps=30, time_step=0.25):
-    df = pd.DataFrame(speeds, columns=['speed'])
-    df['smooth_speed'] = (
-        df['speed']
-        .rolling(window=window_size, center=True, min_periods=1)
-        .mean()
-        .fillna(method='bfill')
-        .fillna(method='ffill')
-    )
-    df['smooth_speed'] = df['smooth_speed'].ewm(alpha=alpha, adjust=False).mean()
-    return  df[df.index % (fps * time_step) == 0]['smooth_speed'].tolist()
-
 def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_kmh):
     """
     Generic function to calculate speed data from detections.
@@ -44,7 +32,7 @@ def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_k
         
         # Apply minimal smoothing to reduce noise while preserving variations
         # Use a smaller window size and exponential moving average for more responsive smoothing
-        window_size = int(fps * time_step * 0.5)
+        window_size = 3
         df['smooth_dist'] = (
             df['dist']
             .rolling(window=window_size, center=True, min_periods=1)
@@ -64,7 +52,7 @@ def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_k
 
         target_times = [i * time_step for i in range(int(len(detections) / (fps * time_step)) + 1)]
         sampled_indices = [int(t * fps) for t in target_times if int(t * fps) < len(detections)]
-        speeds = df.iloc[sampled_indices]['speed'].tolist()
+        speeds = df.iloc[sampled_indices]['smooth_speed'].tolist()
         return speeds
     except Exception as e:
         raise Exception(f"Error in _calculate_speed_data: {e}")
