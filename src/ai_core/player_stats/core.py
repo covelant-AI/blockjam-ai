@@ -1,5 +1,6 @@
 import pandas as pd
 from ai_core.mini_court import MiniCourt
+import numpy as np
 
 def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_kmh):
     """
@@ -29,24 +30,29 @@ def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_k
         df = pd.DataFrame(detections)
         df['dist'] = distances
         
-        # Apply a rolling average to the distance
-        window_size = 5
-        # Apply a rolling average to the distance and fill NaNs
+        # Apply minimal smoothing to reduce noise while preserving variations
+        # Use a smaller window size and exponential moving average for more responsive smoothing
+        window_size = int(fps * time_step * 0.5)
         df['smooth_dist'] = (
             df['dist']
-            .rolling(window=window_size, center=True)
+            .rolling(window=window_size, center=True, min_periods=1)
             .mean()
-            .interpolate(method='polynomial', order=2, limit_direction='both')
-            .combine_first(df['dist']) 
-            .interpolate(method='linear', limit_direction='both')
+            .fillna(method='bfill')
+            .fillna(method='ffill')
         )
         
-        # Ensure smooth_dist is non-negative
+        # Apply exponential moving average for additional smoothing without over-smoothing
+        alpha = 0.3  # Lower alpha = more smoothing, higher alpha = less smoothing
+        df['smooth_dist'] = df['smooth_dist'].ewm(alpha=alpha, adjust=False).mean()
+        
+        # Ensure smooth_dist is non-negative and within reasonable bounds
         df['smooth_dist'] = df['smooth_dist'].clip(lower=0, upper=max_dist_per_frame)
 
-        df['speed'] =  (df['smooth_dist'] * fps * 3.6) # Speed in km/h
+        df['speed'] = (df['smooth_dist'] * fps * 3.6)  # Speed in km/h
 
-        speeds = df[df.index % (fps * time_step) == 0]['speed'].tolist()
+        target_times = [i * time_step for i in range(int(len(detections) / (fps * time_step)) + 1)]
+        sampled_indices = [int(t * fps) for t in target_times if int(t * fps) < len(detections)]
+        speeds = df.iloc[sampled_indices]['speed'].tolist()
         return speeds
     except Exception as e:
         raise Exception(f"Error in _calculate_speed_data: {e}")
