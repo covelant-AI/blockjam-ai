@@ -1,423 +1,758 @@
+from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, Iterable
+from collections import deque
+from typing import List, Tuple, Optional, Dict, Any, Deque, Union
 import numpy as np
 
-# ---------- small helpers ----------
 
-def _center(b: np.ndarray) -> np.ndarray:
-    x1, y1, x2, y2 = b[:4]
-    return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
-
-def _area(b: np.ndarray) -> float:
-    x1, y1, x2, y2 = b[:4]
-    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
-
-def _point_in_poly(pt: np.ndarray, poly_xy: np.ndarray) -> bool:
-    # ray-casting; poly_xy shape: (N,2)
-    x, y = float(pt[0]), float(pt[1])
-    inside = False
-    n = poly_xy.shape[0]
-    for i in range(n):
-        x1, y1 = poly_xy[i]
-        x2, y2 = poly_xy[(i + 1) % n]
-        if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1):
-            inside = not inside
-    return inside
-
-def _apply_H_point(H: np.ndarray, pt_px: np.ndarray) -> np.ndarray:
-    p = np.array([pt_px[0], pt_px[1], 1.0], dtype=np.float32)
-    q = H @ p
-    q /= (q[2] + 1e-12)
-    return q[:2].astype(np.float32)
-
-# ---------- track struct ----------
-
-@dataclass
-class _TrackH:
-    track_id: int
-    bbox_px: np.ndarray              # [x1,y1,x2,y2] in pixels
-    conf: float
-    center_px: np.ndarray            # [cx, cy] in pixels
-    center_wrld: np.ndarray          # [ux, uy] in court units (e.g., meters)
-    vel_wrld: np.ndarray = field(default_factory=lambda: np.zeros(2, np.float32))  # m/s
-    hits: int = 1
-    age: int = 1
-    misses: int = 0
-    speed_ema: float = 0.0           # EMA of speed (m/s)
-    still_streak: int = 0            # consecutive "low-motion" frames
-    bounce_grace_left: int = 0
-    last_matched: int = 0
-
-# ---------- tracker ----------
-
-class BallTracker:
+class TennisBallActiveTracker:
     """
-    Single-ball selector with *required* homography and court polygon.
-    All matching & motion thresholds are in court units (e.g., meters).
+    Single-target tennis ball tracker (detection-only; no prediction).
 
-    Input per frame: Iterable[[x1,y1,x2,y2,conf]] in image pixels.
-    Output per frame: at most one dict:
-        {"track_id": int, "bbox": [x1,y1,x2,y2], "conf": float}
+    Core:
+      - Court gating in PLANE space (image→court homography).
+      - Local association in IMAGE space (nearest to last center) with speed/curvature heuristics.
+      - No extrapolation; on miss, hold last bbox and decay confidence.
+      - ID-stable unless too many misses.
+
+    Guarantees added:
+      - Never pick slow-moving balls OUTSIDE the court.
+      - Never pick static balls INSIDE the court.
+      - Prefer the globally fastest moving ball (estimated against prior frame),
+        with a controlled override over local association.
+
+    Notes:
+      - All *speed* thresholds are in pixels/second.
+      - On the first frame (no history), per-detection speed is unknown and treated as 0.
     """
+
+    # ------------------------ lightweight structs ------------------------
+
+    @dataclass
+    class Detection:
+        bbox_img: Tuple[float, float, float, float]   # (x1,y1,x2,y2) in IMAGE pixels
+        cx_img: float
+        cy_img: float
+        conf: float
+        cls: Optional[int] = None
+        cx_plane: Optional[float] = None              # PLANE coords (for court gating only)
+        cy_plane: Optional[float] = None
+        # annotations used by selection/suppression
+        speed_img: Optional[float] = None             # px/s vs previous frame
+        in_court: Optional[bool] = None               # cached court membership
+
+    @dataclass
+    class TrackState:
+        track_id: int
+        # histories
+        img_trace: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=24))
+        trace_plane: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=64))
+        # last knowns
+        last_plane: Optional[Tuple[float, float]] = None
+        last_bbox_img: Optional[Tuple[float, float, float, float]] = None
+        last_wh_img: Optional[Tuple[float, float]] = None
+        last_conf: float = 0.0
+        # counters
+        missed: int = 0
+        static_streak: int = 0
+        floor_streak_frames: int = 0
+        age_frames: int = 0
+
+    # ------------------------ factories ------------------------
+
+    @classmethod
+    def from_image_polygon(
+        cls,
+        H_img2court: np.ndarray,
+        court_polygon_image: List[Tuple[float, float]],
+        court_gate_margin: float = 0.0,
+        **kwargs
+    ) -> "TennisBallActiveTracker":
+        """Build from an IMAGE-space court polygon; warp once to PLANE space."""
+        court_polygon_plane = cls._warp_poly_img2plane(court_polygon_image, H_img2court)
+        if court_gate_margin != 0.0:
+            court_polygon_plane = cls._inflate_polygon(court_polygon_plane, court_gate_margin)
+        return cls(H_img2court, court_polygon_plane, **kwargs)
+
+    # ------------------------ init ------------------------
 
     def __init__(
         self,
-        H_img2court: np.ndarray,         # 3x3 homography mapping image px -> court coords (meters recommended)
-        court_poly_px: np.ndarray,       # Nx2 polygon in image pixels
-        fps: float,                      # video frame rate
+        H_img2court: np.ndarray,
+        court_polygon_plane: List[Tuple[float, float]],
+        fps: float = 30.0,
         *,
-        # detection filtering
-        min_conf: float = 0.25,
-        min_box_area: Optional[float] = None,
-        max_box_area: Optional[float] = None,
-        court_margin_px: float = 6.0,
-        # gating (world)
-        base_gate_m: float = 1.0,
-        speed_gate_gain: float = 0.30,   # extra meters per (m/s)
-        max_gate_m: float = 3.0,
-        # motion smoothing
-        vel_alpha: float = 0.5,          # EMA for velocity
-        speed_alpha: float = 0.5,        # EMA for speed magnitude
-        # static suppression / bounce awareness
-        suppress_static_output: bool = True,
-        static_speed_thresh_mps: float = 1.0,  # below this treated as "still"
-        static_frames: int = 4,          # consecutive low-motion frames to call static
-        bounce_grace: int = 2,           # allow N low-motion frames (apex/bounce) without suppression
-        # active selection behavior
-        switch_patience: int = 3,        # frames to wait before switching active when misses accrue
-        min_hits_to_emit: int = 2,       # debounce output until track is seen twice
-        # lifecycle
-        max_age: int = 10,               # drop after this many consecutive misses
-        next_id_start: int = 1,
+        # ---- inputs / parsing ----
+        det_format: str = "xyxy",               # "xyxy" or "xywh"
+        normalized: bool = False,               # True if YOLO coords are 0..1
+        image_size: Tuple[int, int] = (1280, 720),
+        only_class: Optional[int] = None,       # set to your ball class id, or None to accept all
+        strict_court_gate: bool = False,        # gate in plane space (False lets outside candidates in)
+        court_gate_margin: float = 0.05,        # inflate plane polygon by this fraction
+
+        # ---- association (IMAGE space) ----
+        max_missed: int = 12,
+        max_speed_plane: float = 3000.0,        # px/s cap for near-track implied speed
+        base_search_radius_px: Optional[float] = None,  # if None, 2% of image diagonal
+        static_patience: int = 6,
+
+        # ---- static / floor heuristics (IMAGE space) ----
+        min_speed_plane: float = 20.0,          # px/s under which considered "static" for streaks
+        rolling_speed_plane: float = 120.0,     # px/s: "rolling" threshold in image space
+        airborne_window: int = 7,               # frames window for curvature
+        a_min_px2: float = 0.45,                # curvature threshold (px/frame^2)
+        floor_penalty_seconds: float = 1.0,     # after this long floor-like, bias to faster dets
+        speed_bonus_beta: float = 0.45,         # cost divisor factor for high-speed dets when penalty active
+        floor_penalty_warmup_frames: Optional[int] = None,
+
+        # ---- bbox & confidence handling ----
+        wh_ema_alpha: float = 0,              # smoothing for w,h
+        conf_decay_per_miss: float = 0.90,      # confidence decay factor^missed
+
+        # ---- suppression ----
+        suppress_slow_outside: bool = True,
+        outside_slow_speed_px: float = 40.0,    # if outside court AND speed < this -> suppress
+        suppress_static_inside: bool = True,
+        inside_static_speed_px: float = 12.0,   # if inside court AND speed < this -> suppress
+
+        # ---- global fastest override ----
+        always_return_fastest: bool = True,     # prefer global-fastest (post-suppression)
+        fast_swap_margin: float = 0.15,         # require >=15% faster than local pick to override
+        keep_id_on_swap: bool = True,           # keep same track_id when swapping target
+        prev_match_radius_px: Optional[float] = None,  # NN radius for speed estimation; default 6% of diag
+
+        # ---- misc ----
+        verbose: bool = False,
     ):
-        # --- validate inputs ---
-        H_img2court = np.asarray(H_img2court, dtype=np.float32)
         assert H_img2court.shape == (3, 3), "H_img2court must be 3x3"
-        det = np.linalg.det(H_img2court[:2, :2])
-        if abs(det) < 1e-8:
-            raise ValueError("H_img2court appears singular in-plane; check your calibration.")
-        court_poly_px = np.asarray(court_poly_px, dtype=np.float32)
-        assert court_poly_px.ndim == 2 and court_poly_px.shape[1] == 2, "court_poly_px must be Nx2"
+        self.H = H_img2court.astype(float)
+        self.H_inv = np.linalg.inv(self.H)       # optional for overlays / debug
+        self.poly = list(court_polygon_plane)
+        if court_gate_margin != 0.0:
+            self.poly = self._inflate_polygon(self.poly, court_gate_margin)
 
-        # --- store config ---
-        self.H = H_img2court
-        self.court_poly_px = court_poly_px
-        self.court_margin_px = float(court_margin_px)
-        self.fps = float(max(1e-6, fps))
+        self.fps = float(fps)
         self.dt = 1.0 / self.fps
+        self.verbose = bool(verbose)
 
-        self.min_conf = float(min_conf)
-        self.min_box_area = float(min_box_area) if min_box_area is not None else None
-        self.max_box_area = float(max_box_area) if max_box_area is not None else None
+        # parsing
+        self.det_format = det_format.lower()
+        self.normalized = bool(normalized)
+        self.image_size = tuple(image_size)
+        self.only_class = only_class
+        self.strict_court_gate = bool(strict_court_gate)
 
-        self.base_gate_m = float(base_gate_m)
-        self.speed_gate_gain = float(speed_gate_gain)
-        self.max_gate_m = float(max_gate_m)
+        # image geometry
+        diag = float(np.hypot(*self.image_size))
+        self.image_diag = diag
 
-        self.vel_alpha = float(vel_alpha)
-        self.speed_alpha = float(speed_alpha)
+        # association thresholds
+        self.max_missed = int(max_missed)
+        self.max_speed_px = float(max_speed_plane)
+        self.base_search_radius_px = float(base_search_radius_px) if base_search_radius_px is not None else max(12.0, 0.02 * diag)
+        self.static_patience = int(static_patience)
 
-        self.suppress_static_output = bool(suppress_static_output)
-        self.static_speed_thresh_mps = float(static_speed_thresh_mps)
-        self.static_frames = int(static_frames)
-        self.bounce_grace = int(bounce_grace)
+        # static / floor heuristics
+        self.min_speed_px = float(min_speed_plane)
+        self.rolling_speed_px = float(rolling_speed_plane)
+        self.airborne_window = int(airborne_window)
+        self.a_min_px2 = float(a_min_px2)
+        self.floor_penalty_frames = int(round(self.fps * float(floor_penalty_seconds)))
+        self.speed_bonus_beta = float(speed_bonus_beta)
+        self.floor_penalty_warmup_frames = (
+            int(floor_penalty_warmup_frames)
+            if floor_penalty_warmup_frames is not None
+            else int(self.airborne_window)
+        )
 
-        self.switch_patience = int(switch_patience)
-        self.min_hits_to_emit = int(min_hits_to_emit)
-        self.max_age = int(max_age)
+        # suppression flags/thresholds
+        self.suppress_slow_outside = bool(suppress_slow_outside)
+        self.outside_slow_speed_px = float(outside_slow_speed_px)
+        self.suppress_static_inside = bool(suppress_static_inside)
+        self.inside_static_speed_px = float(inside_static_speed_px)
 
-        # --- state ---
-        self._tracks: Dict[int, _TrackH] = {}
-        self._next_id = int(next_id_start)
-        self.frame_idx = 0
-        self._active_id: Optional[int] = None
-        self._active_misses = 0
-        self._mode = "SEARCH"  # or "LOCKED"
+        # bbox/conf handling
+        self.wh_ema_alpha = float(np.clip(wh_ema_alpha, 0.0, 1.0))
+        self.conf_decay_per_miss = float(np.clip(conf_decay_per_miss, 0.5, 0.99))
 
-    # ---------- public ----------
+        # global-fastest override config
+        self.always_return_fastest = bool(always_return_fastest)
+        self.fast_swap_margin = float(max(0.0, fast_swap_margin))
+        self.keep_id_on_swap = bool(keep_id_on_swap)
+        self._prev_match_radius_px = (
+            float(prev_match_radius_px) if prev_match_radius_px is not None else max(16.0, 0.06 * diag)
+        )
 
-    def update_polygon(self, court_poly_px):
-        court_poly_px = np.asarray(court_poly_px, dtype=np.float32)
-        assert court_poly_px.ndim == 2 and court_poly_px.shape[1] == 2, "court_poly_px must be Nx2"
-        self.court_poly_px = court_poly_px
+        # track
+        self.track: Optional[TennisBallActiveTracker.TrackState] = None
+        self._next_tid = 1
+
+        # last assoc debug
+        self._last_assoc_dbg: Optional[Dict[str, Any]] = None
+
+        # prev-frame detections (for per-detection speed estimation)
+        self._prev_dets_img: List[Tuple[float, float]] = []
+
+    # ------------------------ public API ------------------------
+
+    def update(self, yolo_dets: List[Union[Dict[str, Any], Tuple]]) -> Optional[Dict[str, Any]]:
+        """
+        yolo_dets items can be:
+          - dict: {'bbox':[x1,y1,x2,y2], 'conf':0.87, 'class':0 (optional)}
+          - tuple: (x1,y1,x2,y2, conf[, class])  or (cx,cy,w,h, conf[, class]) if det_format='xywh'
+        Returns dict with keys: track_id, bbox [x1,y1,x2,y2], conf, plus extras & debug.
+        """
+        dbg = {
+            "n_input": len(yolo_dets),
+            "n_after_class": 0,
+            "n_projected": 0,
+            "n_in_court": 0,
+            "assoc_cost": None,
+            "used_source": None,
+            "warning": None,
+            "assoc_dbg": None,
+        }
+
+        # Parse and project to plane (for court gating)
+        dets_all = self._parse_and_project(yolo_dets)
+        dbg["n_after_class"] = len(dets_all)
+        dbg["n_projected"] = sum(1 for d in dets_all if (d.cx_plane is not None and np.isfinite(d.cx_plane)))
+        if self.verbose:
+            for d in dets_all:
+                print(f"IMG({d.cx_img:.1f},{d.cy_img:.1f}) -> PLANE({d.cx_plane},{d.cy_plane}) conf={d.conf:.3f}")
+
+        # plane-space court gating (hard or soft)
+        if self.strict_court_gate:
+            dets = [d for d in dets_all if (d.cx_plane is not None and self._point_in_polygon((d.cx_plane, d.cy_plane), self.poly))]
+        else:
+            dets = [d for d in dets_all if d.cx_plane is not None]
+        dbg["n_in_court"] = len(dets)
+
+        # Annotate in_court + per-detection speed vs previous frame
+        self._annotate_in_court(dets)
+        self._annotate_speeds(dets)
+
+        chosen = None
+        source = "hold"
+
+        if self.track is None:
+            # Prefer the globally fastest valid detection
+            if self.always_return_fastest:
+                chosen = self._pick_fastest_global(dets)
+                source = "global-fastest" if chosen is not None else "hold"
+            # Fallback: initial pick still enforces suppression with unknown speed treated as 0
+            if chosen is None:
+                chosen = self._select_initial(dets)
+            if chosen is not None:
+                self._initialize_from_detection(chosen)
+                if source == "hold":
+                    source = "measurement"
+            else:
+                dbg["warning"] = "No viable detections after plane gating. Check homography and polygon warp."
+        else:
+            # Local (stable) association near last center
+            chosen_local, cost = self._associate_by_image_last(dets, return_cost=True)
+            dbg["assoc_cost"] = cost
+            dbg["assoc_dbg"] = self._last_assoc_dbg
+            chosen = chosen_local
+            source = "measurement" if chosen_local is not None else "hold"
+
+            # Global-fastest override (post-suppression)
+            if self.always_return_fastest:
+                fastest = self._pick_fastest_global(dets)
+                if fastest is not None:
+                    sp_fast = fastest.speed_img if (fastest.speed_img is not None and np.isfinite(fastest.speed_img)) else 0.0
+                    sp_loc = (
+                        chosen_local.speed_img if (chosen_local is not None and chosen_local.speed_img is not None and np.isfinite(chosen_local.speed_img))
+                        else (self._img_speed_pxps() or 0.0)
+                    )
+                    if sp_fast > (1.0 + self.fast_swap_margin) * max(sp_loc, 1e-6):
+                        chosen = fastest
+                        source = "global-fastest-override"
+
+            if chosen is not None:
+                if source.startswith("global-fastest") and not self.keep_id_on_swap:
+                    self._initialize_from_detection(chosen)  # resets ID
+                else:
+                    self._ingest_measurement(chosen)
+            else:
+                self.track.missed += 1
+
+        # housekeeping / kill
+        if self.track is not None:
+            t = self.track
+            t.age_frames += 1
+
+            img_speed = self._img_speed_pxps()
+            if self._is_airborne():
+                t.static_streak = 0
+            else:
+                if (img_speed is not None) and (img_speed < self.min_speed_px):
+                    t.static_streak += 1
+                else:
+                    t.static_streak = 0
+
+            if self._is_floor_like(img_speed if img_speed is not None else 0.0):
+                t.floor_streak_frames += 1
+            else:
+                t.floor_streak_frames = max(0, t.floor_streak_frames - 1)
+
+            if t.missed > self.max_missed:
+                self.track = None
+
+        # store prev detections for next-frame speed estimation regardless of outcome
+        self._prev_dets_img = [(d.cx_img, d.cy_img) for d in dets_all]
+
+        if self.track is None:
+            return None
+
+        # compose bbox/conf (hold last measurement on misses)
+        out_bbox: Optional[Tuple[float, float, float, float]] = self.track.last_bbox_img
+        out_conf: float = float(self.track.last_conf)
+        if self.track.missed > 0:
+            out_conf *= self.conf_decay_per_miss ** max(1, self.track.missed)
+
+        # Clip bbox to image bounds
+        if out_bbox is not None:
+            out_bbox = self._clip_bbox(out_bbox)
+        if out_bbox is None:
+            return None
+
+        # FINAL OUTPUT SUPPRESSION: never emit slow-outside or static-inside
+        last_plane = self.track.last_plane
+        in_court_now = (last_plane is not None) and self._point_in_polygon(last_plane, self.poly)
+        cur_spd = self._img_speed_pxps() or 0.0
+        if in_court_now and self.suppress_static_inside and (cur_spd < self.inside_static_speed_px):
+            return None
+        if (not in_court_now) and self.suppress_slow_outside and (cur_spd < self.outside_slow_speed_px):
+            return None
+
+        cx, cy = self._bbox_center_xyxy(out_bbox)
+        plane_speed = self._plane_speed_from_trace()
+
+        return {
+            "track_id": int(self.track.track_id),
+            "bbox": [float(out_bbox[0]), float(out_bbox[1]), float(out_bbox[2]), float(out_bbox[3])],
+            "conf": float(out_conf),
+            # extras
+            "source": "measurement",  # or "global-fastest"/"global-fastest-override" in debug
+            "image_center": (float(cx), float(cy)),
+            "image_speed_pxps": float(cur_spd),
+            "plane_xy": self.track.last_plane if (self.track.last_plane is not None) else (None, None),
+            "plane_speed": plane_speed if plane_speed is not None else None,
+            "missed": int(self.track.missed),
+            "is_static_warning": bool(self.track.static_streak >= max(1, self.static_patience // 2)),
+            "floor_penalty_active": self._floor_penalty_active(),
+            "floor_streak_frames": int(self.track.floor_streak_frames),
+            # diagnostics
+            "debug": {
+                **dbg,
+                "used_source": dbg.get("used_source"),
+            },
+        }
 
     def reset(self):
-        self._tracks.clear()
-        self._next_id = 1
-        self.frame_idx = 0
-        self._active_id = None
-        self._active_misses = 0
-        self._mode = "SEARCH"
+        self.track = None
+        self._prev_dets_img = []
 
-    def update(self, detections: Iterable[Iterable[float]]) -> List[Dict]:
-        """
-        Update the tracker with YOLO-like detections: [x1,y1,x2,y2,conf]
-        Returns 0 or 1 track (the active ball).
-        """
-        self.frame_idx += 1
-        dets = self._filter_and_gate_dets(detections)
+    # ------------------------ internals ------------------------
 
-        # centers in px and world
-        if dets.shape[0]:
-            det_centers_px = np.stack([_center(d[:4]) for d in dets], axis=0)
-            det_centers_wrld = np.stack([_apply_H_point(self.H, c) for c in det_centers_px], axis=0)
+    def _parse_and_project(self, yolo_dets: List[Union[Dict[str, Any], Tuple]]) -> List[Detection]:
+        dets: List[TennisBallActiveTracker.Detection] = []
+        W, H = self.image_size
+
+        for obj in yolo_dets:
+            # unpack
+            if isinstance(obj, dict):
+                box = obj.get("bbox")
+                conf = float(obj.get("conf", 1.0))
+                cls = obj.get("class", None)
+            else:
+                box = obj[:4]
+                conf = float(obj[4])
+                cls = obj[5] if len(obj) > 5 else None
+
+            # class filtering (strict)
+            if self.only_class is not None:
+                if cls is None or int(cls) != int(self.only_class):
+                    continue
+
+            # normalized?
+            if self.normalized:
+                bx = list(box)
+                bx = [bx[0] * W, bx[1] * H, bx[2] * W, bx[3] * H]
+                box = tuple(bx)
+
+            # format conversion
+            if self.det_format == "xywh":
+                cx, cy, w, h = box
+                x1 = cx - w / 2.0
+                y1 = cy - h / 2.0
+                x2 = cx + w / 2.0
+                y2 = cy + h / 2.0
+            else:
+                x1, y1, x2, y2 = box
+
+            # clip
+            x1 = float(max(0.0, min(W - 1.0, x1)))
+            y1 = float(max(0.0, min(H - 1.0, y1)))
+            x2 = float(max(0.0, min(W - 1.0, x2)))
+            y2 = float(max(0.0, min(H - 1.0, y2)))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            cx_img, cy_img = self._bbox_center_xyxy((x1, y1, x2, y2))
+            plane = self._apply_homography_img2plane((cx_img, cy_img), self.H)
+            dets.append(self.Detection(
+                bbox_img=(x1, y1, x2, y2),
+                cx_img=cx_img, cy_img=cy_img,
+                conf=conf, cls=cls,
+                cx_plane=float(plane[0]) if plane is not None else None,
+                cy_plane=float(plane[1]) if plane is not None else None,
+            ))
+
+        dets.sort(key=lambda d: d.conf, reverse=True)  # bias initial pick
+        return dets
+
+    def _initialize_from_detection(self, d: Detection):
+        t = self.TrackState(track_id=self._next_tid)
+        self._next_tid += 1
+
+        # histories
+        t.img_trace.append((d.cx_img, d.cy_img))
+        if d.cx_plane is not None and d.cy_plane is not None:
+            t.last_plane = (d.cx_plane, d.cy_plane)
+            t.trace_plane.append(t.last_plane)
+
+        # bbox & conf
+        t.last_bbox_img = d.bbox_img
+        t.last_wh_img = (d.bbox_img[2]-d.bbox_img[0], d.bbox_img[3]-d.bbox_img[1])
+        t.last_conf = float(d.conf)
+
+        self.track = t
+
+    def _ingest_measurement(self, d: Detection):
+        t = self.track
+        # histories
+        t.img_trace.append((d.cx_img, d.cy_img))
+        # smooth w,h (EMA)
+        w = d.bbox_img[2] - d.bbox_img[0]
+        h = d.bbox_img[3] - d.bbox_img[1]
+        if t.last_wh_img is None:
+            t.last_wh_img = (float(w), float(h))
         else:
-            det_centers_px = np.zeros((0, 2), np.float32)
-            det_centers_wrld = np.zeros((0, 2), np.float32)
+            a = self.wh_ema_alpha
+            t.last_wh_img = (a*float(w) + (1-a)*t.last_wh_img[0],
+                             a*float(h) + (1-a)*t.last_wh_img[1])
+        # update bbox/conf
+        t.last_bbox_img = d.bbox_img
+        t.last_conf = float(d.conf)
+        t.missed = 0
+        # plane trace (debug)
+        if d.cx_plane is not None and d.cy_plane is not None:
+            t.last_plane = (d.cx_plane, d.cy_plane)
+            t.trace_plane.append(t.last_plane)
 
-        # predict centers in world for all tracks
-        track_ids = list(self._tracks.keys())
-        pred_wrld: Dict[int, np.ndarray] = {}
-        for tid in track_ids:
-            t = self._tracks[tid]
-            pred_wrld[tid] = t.center_wrld + t.vel_wrld * self.dt
+    def _select_initial(self, dets: List[Detection]) -> Optional[Detection]:
+        """Pick an initial detection enforcing slow/static suppression. Unknown speed treated as 0."""
+        if not dets:
+            return None
+        kept = []
+        for d in dets:
+            spd = d.speed_img if (d.speed_img is not None and np.isfinite(d.speed_img)) else 0.0
+            if (d.in_court is True) and self.suppress_static_inside and (spd < self.inside_static_speed_px):
+                continue
+            if (d.in_court is False) and self.suppress_slow_outside and (spd < self.outside_slow_speed_px):
+                continue
+            kept.append(d)
+        if not kept:
+            return None
+        # Prefer in-court; tie-break by confidence
+        in_court = [d for d in kept if d.in_court]
+        pool = in_court if in_court else kept
+        return max(pool, key=lambda d: d.conf)
 
-        # associate via greedy on world distance with dynamic gate
-        matches, unmatched_tids, unmatched_dets = self._greedy_match_world(
-            track_ids, pred_wrld, det_centers_wrld
+    # --------- association: NN to last measured center (IMAGE space) + suppression ---------
+
+    def _associate_by_image_last(self, dets: List[Detection], return_cost: bool = False):
+        """
+        Associate by IMAGE space to the last measured center.
+        Priority: implied speed first, then confidence, then proximity.
+        Suppress slow outside-court and static inside-court per thresholds.
+        """
+        if self.track is None or not dets or len(self.track.img_trace) == 0:
+            self._last_assoc_dbg = {"n_candidates": 0}
+            return (None, None) if return_cost else None
+
+        px, py = self.track.img_trace[-1]  # last measured center
+        missed = max(0, self.track.missed)
+        recent_speed = self._img_speed_pxps() or 0.0
+
+        # Adaptive search radius grows with speed & misses
+        gate_r = self.base_search_radius_px * (1.0 + 0.002 * recent_speed) * (1.0 + 0.30 * missed)
+        gate_r = float(np.clip(gate_r, self.base_search_radius_px, 0.25 * float(np.hypot(*self.image_size))))
+
+        rej = {"radius": 0, "speed_cap": 0, "nan": 0, "outside_slow": 0, "inside_static": 0}
+        kept = 0
+
+        best = None
+        best_speed = -np.inf
+        best_conf = -np.inf
+        best_dist = np.inf
+
+        speed_cap = self.max_speed_px * (1.0 + 0.15 * missed)
+
+        for d in dets:
+            x, y = d.cx_img, d.cy_img
+            if not np.isfinite(x) or not np.isfinite(y):
+                rej["nan"] += 1
+                continue
+
+            dist = float(np.hypot(x - px, y - py))
+            if dist > gate_r:
+                rej["radius"] += 1
+                continue
+
+            spd = dist / max(self.dt, 1e-9)  # px/s relative to last center (association proxy)
+            if spd > speed_cap:
+                rej["speed_cap"] += 1
+                continue
+
+            # Soft court check even if strict gate already applied
+            in_court = (d.cx_plane is not None) and self._point_in_polygon((d.cx_plane, d.cy_plane), self.poly)
+
+            # Suppress slow outside-court
+            if (not in_court) and self.suppress_slow_outside and (spd < self.outside_slow_speed_px):
+                rej["outside_slow"] += 1
+                continue
+
+            # Suppress static inside-court
+            if in_court and self.suppress_static_inside and (spd < self.inside_static_speed_px):
+                rej["inside_static"] += 1
+                continue
+
+            kept += 1
+
+            # Selection: higher speed, then higher confidence, then smaller distance
+            if (spd > best_speed or
+                (np.isclose(spd, best_speed) and (float(d.conf) > best_conf or
+                                                  (np.isclose(float(d.conf), best_conf) and dist < best_dist)))):
+                best = d
+                best_speed = spd
+                best_conf = float(d.conf)
+                best_dist = dist
+
+        # Debug
+        self._last_assoc_dbg = {
+            "gate_r": gate_r,
+            "speed_cap": speed_cap,
+            "missed": missed,
+            "recent_speed": recent_speed,
+            "rejections": rej,
+            "kept": kept,
+            "n_candidates": len(dets),
+            "winner_speed_pxps": best_speed if best is not None else None,
+        }
+
+        best_cost = (-best_speed) if best is not None and np.isfinite(best_speed) else float("inf")
+        return (best, best_cost) if return_cost else best
+
+    # --------- telemetry ---------
+
+    def _img_speed_pxps(self) -> Optional[float]:
+        """Image-space speed (px/s) from last two measurements of the current track."""
+        if self.track is None or len(self.track.img_trace) < 2:
+            return None
+        (x1, y1) = self.track.img_trace[-1]
+        (x0, y0) = self.track.img_trace[-2]
+        return float(np.hypot(x1 - x0, y1 - y0) / max(self.dt, 1e-9))
+
+    def _plane_speed_from_trace(self) -> Optional[float]:
+        """Approx plane speed from last two plane points (diagnostics only)."""
+        if self.track is None or len(self.track.trace_plane) < 2:
+            return None
+        (x1, y1) = self.track.trace_plane[-1]
+        (x0, y0) = self.track.trace_plane[-2]
+        if x1 is None or y1 is None or x0 is None or y0 is None:
+            return None
+        dist = float(np.hypot(x1 - x0, y1 - y0))
+        return dist / max(self.dt, 1e-9)
+
+    # ------------------------ floor & airborne heuristics (IMAGE space) ------------------------
+
+    def _floor_penalty_active(self) -> bool:
+        return (
+            self.track is not None
+            and self.track.age_frames >= self.floor_penalty_warmup_frames
+            and self.track.floor_streak_frames >= self.floor_penalty_frames
         )
 
-        # update matched
-        for tid, di in matches:
-            self._update_track(self._tracks[tid], dets[di, :4], float(dets[di, 4]))
+    def _is_airborne(self) -> bool:
+        """Treat as airborne when image-space vertical curvature is present. Needs enough points."""
+        a = self._parabolic_ay()
+        return (a is not None) and (abs(a) >= self.a_min_px2)
 
-        # spawn policy
-        spawnable = self._spawnable_indices(unmatched_dets, det_centers_wrld, pred_wrld)
-        for di in sorted(spawnable, key=lambda i: float(dets[i, 4]), reverse=True):
-            self._spawn_from_det(dets, di)
+    def _is_floor_like(self, img_speed_pxps: float) -> bool:
+        slow = (img_speed_pxps < self.rolling_speed_px)
+        a = self._parabolic_ay()
+        low_curvature = (abs(a) < self.a_min_px2) if a is not None else False
+        return bool(slow and low_curvature)
 
-        # age & prune
-        self._age_and_prune(unmatched_tids)
+    def _parabolic_ay(self) -> Optional[float]:
+        if self.track is None:
+            return None
+        pts = list(self.track.img_trace)
+        if len(pts) < max(4, self.airborne_window):
+            return None
+        y = np.array([p[1] for p in pts[-self.airborne_window:]], dtype=float)
+        n = len(y)
+        t = np.arange(n, dtype=float) - (n - 1) * 0.5  # frames, centered
+        A = np.column_stack([t**2, t, np.ones(n)])
+        try:
+            coeffs, *_ = np.linalg.lstsq(A, y, rcond=None)
+            return float(coeffs[0])  # px / frame^2
+        except np.linalg.LinAlgError:
+            return None
 
-        # active selection
-        self._update_active(matches, det_centers_wrld)
+    # ------------------------ helpers ------------------------
 
-        # emit
-        return self._emit()
+    @staticmethod
+    def _warp_poly_img2plane(poly_img: List[Tuple[float, float]], H_img2court: np.ndarray) -> List[Tuple[float, float]]:
+        out = []
+        for (x, y) in poly_img:
+            v = np.array([x, y, 1.0], dtype=float)
+            w = H_img2court @ v
+            if (not np.isfinite(w).all()) or abs(w[2]) < 1e-8:
+                raise ValueError("Invalid homography projection for court vertex; check H_img2court and input points.")
+            out.append((float(w[0] / w[2]), float(w[1] / w[2])))
+        if len(out) < 3:
+            raise ValueError("Warped court polygon has <3 vertices; check H_img2court.")
+        return out
 
-    # ---------- internals ----------
+    @staticmethod
+    def _inflate_polygon(poly: List[Tuple[float, float]], margin: float) -> List[Tuple[float, float]]:
+        """Inflate polygon by moving each vertex away from centroid by (1+margin)."""
+        P = np.array(poly, dtype=float)
+        c = P.mean(axis=0)
+        return [tuple((c + (p - c) * (1.0 + margin)).tolist()) for p in P]
 
-    def _filter_and_gate_dets(self, dets_in: Iterable[Iterable[float]]) -> np.ndarray:
-        if dets_in is None:
-            return np.zeros((0, 5), dtype=np.float32)
-        arr = np.array(list(dets_in), dtype=np.float32).reshape(-1, 5)
-        if arr.size == 0:
-            return arr
+    @staticmethod
+    def _apply_homography_img2plane(pt_xy: Tuple[float, float], H_img2court: np.ndarray) -> Optional[Tuple[float, float]]:
+        x, y = pt_xy
+        v = np.array([x, y, 1.0], dtype=float)
+        w = H_img2court @ v
+        if (not np.isfinite(w).all()) or abs(w[2]) < 1e-8:
+            return None
+        return (float(w[0] / w[2]), float(w[1] / w[2]))
 
-        keep = arr[:, 4] >= self.min_conf
-        if self.min_box_area is not None or self.max_box_area is not None:
-            areas = np.array([_area(b) for b in arr[:, :4]])
-            if self.min_box_area is not None:
-                keep &= areas >= self.min_box_area
-            if self.max_box_area is not None:
-                keep &= areas <= self.max_box_area
+    @staticmethod
+    def _apply_homography_plane2img(pt_xy: Tuple[float, float], H_plane2img: np.ndarray) -> Optional[Tuple[float, float]]:
+        x, y = pt_xy
+        v = np.array([x, y, 1.0], dtype=float)
+        w = H_plane2img @ v
+        if (not np.isfinite(w).all()) or abs(w[2]) < 1e-8:
+            return None
+        return (float(w[0] / w[2]), float(w[1] / w[2]))
 
-        # court polygon with small outward margin
-        if self.court_poly_px is not None:
-            poly = self._grow_poly(self.court_poly_px, self.court_margin_px)
-            centers = np.stack([_center(b) for b in arr[:, :4]], axis=0)
-            mask = np.array([_point_in_poly(centers[i], poly) for i in range(centers.shape[0])])
-            keep &= mask
-
-        return arr[keep]
-
-    def _grow_poly(self, poly: np.ndarray, margin_px: float) -> np.ndarray:
-        # simple radial growth around centroid (approximate)
-        c = np.mean(poly, axis=0, keepdims=True)
-        vec = poly - c
-        norms = np.linalg.norm(vec, axis=1) + 1e-6
-        # per-vertex scaling factor to achieve ~margin increase
-        scale = (norms + margin_px) / norms
-        return (c + vec * scale[:, None]).astype(np.float32)
-
-    def _gate_radius(self, t: Optional[_TrackH]) -> float:
-        if t is None:
-            return min(self.base_gate_m, self.max_gate_m)
-        speed = float(np.linalg.norm(t.vel_wrld))  # m/s
-        g = self.base_gate_m + self.speed_gate_gain * speed
-        return float(min(g, self.max_gate_m))
-
-    def _greedy_match_world(
-        self,
-        track_ids: List[int],
-        pred_wrld: Dict[int, np.ndarray],
-        det_centers_wrld: np.ndarray
-    ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
-        if not track_ids or det_centers_wrld.shape[0] == 0:
-            return [], track_ids, list(range(det_centers_wrld.shape[0]))
-
-        pairs = []
-        for ti, tid in enumerate(track_ids):
-            t = self._tracks[tid]
-            gate = self._gate_radius(t)
-            diffs = det_centers_wrld - pred_wrld[tid][None, :]
-            dists = np.sqrt(np.sum(diffs * diffs, axis=1))  # meters
-            for di, d in enumerate(dists):
-                if d <= gate:
-                    pairs.append((ti, di, float(d)))
-
-        # no candidate pairs -> everything unmatched
-        if not pairs:
-            return [], track_ids, list(range(det_centers_wrld.shape[0]))
-
-        # sort by distance ascending
-        pairs.sort(key=lambda x: x[2])
-        assigned_t = set()
-        assigned_d = set()
-        matches: List[Tuple[int, int]] = []
-
-        for ti, di, _ in pairs:
-            if ti in assigned_t or di in assigned_d:
-                continue
-            assigned_t.add(ti)
-            assigned_d.add(di)
-            matches.append((track_ids[ti], di))
-
-        unmatched_tids = [tid for i, tid in enumerate(track_ids) if i not in assigned_t]
-        unmatched_dets = [di for di in range(det_centers_wrld.shape[0]) if di not in assigned_d]
-        return matches, unmatched_tids, unmatched_dets
-
-    def _spawnable_indices(
-        self,
-        unmatched_dets: List[int],
-        det_centers_wrld: np.ndarray,
-        pred_wrld: Dict[int, np.ndarray],
-    ) -> List[int]:
-        if self._mode == "LOCKED" and self._active_id in self._tracks:
-            # only spawn near the active prediction
-            t = self._tracks[self._active_id]
-            gate = self._gate_radius(t)
-            ref = pred_wrld.get(self._active_id, t.center_wrld)
-            return [di for di in unmatched_dets if np.linalg.norm(det_centers_wrld[di] - ref) <= gate]
-        else:
-            # in SEARCH, allow any (already court-filtered)
-            return unmatched_dets
-
-    def _spawn_from_det(self, dets: np.ndarray, di: int):
-        b = dets[di, :4].astype(np.float32)
-        c = float(dets[di, 4])
-        cx = _center(b)
-        cw = _apply_H_point(self.H, cx)
-        tid = self._next_id
-        self._next_id += 1
-        self._tracks[tid] = _TrackH(
-            track_id=tid,
-            bbox_px=b.copy(),
-            conf=c,
-            center_px=cx,
-            center_wrld=cw,
-            hits=1,
-            age=1,
-            misses=0,
-            last_matched=self.frame_idx,
-            bounce_grace_left=self.bounce_grace
-        )
-        if self._active_id is None:
-            self._active_id = tid
-            self._active_misses = 0
-            self._mode = "LOCKED"
-
-    def _update_track(self, t: _TrackH, det_bbox_px: np.ndarray, det_conf: float):
-        prev_wrld = t.center_wrld.copy()
-
-        new_center_px = _center(det_bbox_px)
-        new_wrld = _apply_H_point(self.H, new_center_px)
-        disp_wrld = new_wrld - prev_wrld  # meters per frame
-        inst_speed = float(np.linalg.norm(disp_wrld)) / self.dt  # m/s
-
-        # EMA velocity (m/s) and speed
-        t.vel_wrld = (1.0 - self.vel_alpha) * t.vel_wrld + self.vel_alpha * (disp_wrld / self.dt)
-        t.speed_ema = (1.0 - self.speed_alpha) * t.speed_ema + self.speed_alpha * inst_speed
-
-        # stillness & bounce grace
-        if inst_speed < self.static_speed_thresh_mps:
-            t.still_streak += 1
-            t.bounce_grace_left = max(0, t.bounce_grace_left - 1)
-        else:
-            t.still_streak = 0
-            t.bounce_grace_left = self.bounce_grace
-
-        # bookkeeping
-        t.bbox_px = det_bbox_px.astype(np.float32)
-        t.center_px = new_center_px.astype(np.float32)
-        t.center_wrld = new_wrld.astype(np.float32)
-        t.conf = float(det_conf)
-        t.hits += 1
-        t.misses = 0
-        t.age += 1
-        t.last_matched = self.frame_idx
-
-    def _age_and_prune(self, tids: List[int]):
-        to_drop = []
-        for tid in tids:
-            tr = self._tracks.get(tid)
-            if tr is None:
-                continue
-            tr.misses += 1
-            tr.age += 1
-            tr.bounce_grace_left = max(0, tr.bounce_grace_left - 1)
-            if tr.misses > self.max_age:
-                to_drop.append(tid)
-        for tid in to_drop:
-            if tid == self._active_id:
-                self._active_id = None
-                self._active_misses = 0
-                self._mode = "SEARCH"
-            self._tracks.pop(tid, None)
-
-    def _update_active(self, matches: List[Tuple[int, int]], det_centers_wrld: np.ndarray):
-        matched_ids = {tid for tid, _ in matches}
-
-        # keep current active if matched or within patience
-        if self._active_id is not None and self._active_id in self._tracks:
-            if self._active_id in matched_ids:
-                self._active_misses = 0
-                self._mode = "LOCKED"
-                return
-            self._active_misses += 1
-            if self._active_misses <= self.switch_patience:
-                self._mode = "LOCKED"
-                return
-
-        # choose a new active if needed
-        if self._tracks:
-            def score(t: _TrackH) -> Tuple[float, float, float]:
-                # lower distance to nearest current det is better
-                if det_centers_wrld.shape[0]:
-                    pred = t.center_wrld + t.vel_wrld * self.dt
-                    dists = np.linalg.norm(det_centers_wrld - pred[None, :], axis=1)
-                    d = float(np.min(dists))
-                else:
-                    d = 1e9
-                return (-d, float(t.hits), float(t.conf))
-            cand = max(self._tracks.values(), key=score)
-            self._active_id = cand.track_id
-            self._active_misses = 0
-            self._mode = "LOCKED"
-        else:
-            self._active_id = None
-            self._active_misses = 0
-            self._mode = "SEARCH"
-
-    def _is_static_for_output(self, t: _TrackH) -> bool:
-        if t.bounce_grace_left > 0:
+    @staticmethod
+    def _point_in_polygon(pt: Tuple[float, float], poly: List[Tuple[float, float]]) -> bool:
+        """Even-odd rule with simple on-edge handling treated as inside."""
+        x, y = pt
+        n = len(poly)
+        if n < 3:
             return False
-        if t.still_streak >= self.static_frames:
-            return True
-        return t.speed_ema < self.static_speed_thresh_mps
+        eps = 1e-9
+        inside = False
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
 
-    def _emit(self) -> List[Dict]:
-        if self._active_id is None or self._active_id not in self._tracks:
-            return []
-        t = self._tracks[self._active_id]
-        if t.hits < self.min_hits_to_emit:
-            return []
-        if self.suppress_static_output and self._is_static_for_output(t):
-            return []
-        return [{
-            "track_id": int(t.track_id),
-            "bbox": [float(t.bbox_px[0]), float(t.bbox_px[1]),
-                     float(t.bbox_px[2]), float(t.bbox_px[3])],
-            "conf": float(t.conf),
-            "label": "ball",
-        }]
+            # On-edge check (bounding-box + cross-product collinearity)
+            if min(x1, x2) - eps <= x <= max(x1, x2) + eps and min(y1, y2) - eps <= y <= max(y1, y2) + eps:
+                dx, dy = x2 - x1, y2 - y1
+                if abs(dx * (y - y1) - dy * (x - x1)) <= eps:
+                    return True
+
+            # Ray casting (skip horizontal edges consistently)
+            if (y1 > y) != (y2 > y):
+                x_int = (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1
+                if x_int >= x:
+                    inside = not inside
+        return inside
+
+    @staticmethod
+    def _bbox_center_xyxy(b: Tuple[float, float, float, float]) -> Tuple[float, float]:
+        x1, y1, x2, y2 = b
+        return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+
+    def _clip_bbox(self, b: Tuple[float, float, float, float]) -> Optional[Tuple[float, float, float, float]]:
+        W, H = self.image_size
+        x1, y1, x2, y2 = b
+        x1 = max(0.0, min(W - 1.0, x1))
+        x2 = max(0.0, min(W - 1.0, x2))
+        y1 = max(0.0, min(H - 1.0, y1))
+        y2 = max(0.0, min(H - 1.0, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
+
+    # ------------------------ speed & global pick ------------------------
+
+    def _annotate_in_court(self, dets: List[Detection]) -> None:
+        for d in dets:
+            d.in_court = (d.cx_plane is not None) and self._point_in_polygon((d.cx_plane, d.cy_plane), self.poly)
+
+    def _annotate_speeds(self, dets: List[Detection]) -> None:
+        """
+        Estimate per-detection speed via nearest-neighbor to previous frame centers.
+        After the first frame, always assign a finite value; clamp to a sanity cap.
+        """
+        if not self._prev_dets_img:
+            for d in dets:
+                d.speed_img = None  # first frame → unknown
+            return
+
+        cap = self.max_speed_px * 3.0  # sanity cap against wild matches
+        r = self._prev_match_radius_px
+        r2 = r * r
+
+        for d in dets:
+            best_d2 = None
+            # simple NN; if within radius, accept; else still compute but we'll clamp
+            for (px, py) in self._prev_dets_img:
+                dx, dy = d.cx_img - px, d.cy_img - py
+                d2 = dx*dx + dy*dy
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+            if best_d2 is None:
+                d.speed_img = 0.0
+                continue
+            # If the best match is absurdly far, still produce a number but clamp
+            dist = float(np.sqrt(best_d2))
+            spd = dist / max(self.dt, 1e-9)
+            if best_d2 > r2:
+                # outside NN radius → likely new/ambiguous; treat as small but nonzero
+                spd = min(spd, self.outside_slow_speed_px * 0.9)
+            d.speed_img = float(min(spd, cap))
+
+    def _pick_fastest_global(self, dets: List[Detection]) -> Optional[Detection]:
+        """Return the fastest detection after applying slow-outside/static-inside suppression."""
+        best = None
+        best_spd = -np.inf
+        for d in dets:
+            spd = d.speed_img if (d.speed_img is not None and np.isfinite(d.speed_img)) else 0.0
+
+            # Suppression rules
+            if (d.in_court is False) and self.suppress_slow_outside and (spd < self.outside_slow_speed_px):
+                continue
+            if (d.in_court is True) and self.suppress_static_inside and (spd < self.inside_static_speed_px):
+                continue
+
+            # Hard sanity cap
+            if spd > self.max_speed_px * 3.0:
+                continue
+
+            if (spd > best_spd) or (np.isclose(spd, best_spd) and float(d.conf) > float(best.conf if best else -np.inf)):
+                best = d
+                best_spd = spd
+        return best
