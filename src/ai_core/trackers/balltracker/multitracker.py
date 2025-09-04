@@ -90,12 +90,12 @@ class TennisBallActiveMultiTracker:
         image_size: Tuple[int, int] = (1280, 720),
         only_class: Optional[int] = None,
         strict_court_gate: bool = False,
-        court_gate_margin: float = 0.05,
+        court_gate_margin: float = 0,
 
         # Association / gating
         max_missed: int = 10,
-        max_speed_px: float = 4000.0,
-        base_search_radius_px: Optional[float] = 0.03,  # None → 2% diag; <1.0 → fraction of diag; ≥1.0 → px
+        max_speed_px: float = 8000,
+        base_search_radius_px: Optional[float] = 0.04,  # None → 2% diag; <1.0 → fraction of diag; ≥1.0 → px
         dir_cos_min: float = -1.0,
         # (IoU rescue is disabled in association; kept for compat)
         iou_gate: float = 0.10,
