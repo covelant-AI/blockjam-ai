@@ -24,7 +24,8 @@ def handler(job):
     models_path = os.path.join(root_dir, models_path)
     
     ai_models = ai_core.initialize_models(
-        ball_and_player_tracker_model_path=os.path.join(models_path, "yolo_ball_and_player_best.pt"),
+        ball_tracker_model_path="src/ai_core/trackers/detector/weights/best-balls.pt",
+        player_tracker_model_path="src/ai_core/trackers/detector/weights/best-player.pt",
         court_line_detector_model_path=os.path.join(models_path, "model_tennis_court_det.pt"),
         letr_court_line_detector_model_path=os.path.join(models_path, "letr_best_checkpoint.pth"),
     )

@@ -6,9 +6,10 @@ from ai_core.player_stats.core import smooth_speed_data
 import requests
 import os
 import numpy as np
+import pickle
 
-def make_speeds_request(video_id, ball_and_player_tracker: BallAndPlayerTracker, req_world_tracks, start_index, end_index, fps, speed_time_step):
-    ball_detections, ball_speeds, p1_detections, p1_speeds, p2_detections, p2_speeds = ball_and_player_tracker.extract_from_world_tracks(req_world_tracks)
+def make_speeds_request(video_id, ball_and_player_tracker: BallAndPlayerTracker, req_ball_tracks, req_player_tracks, start_index, end_index, fps, speed_time_step):
+    ball_detections, ball_speeds, p1_detections, p1_speeds, p2_detections, p2_speeds = ball_and_player_tracker.extract_from_world_tracks(req_ball_tracks, req_player_tracks)
     section = {
         "start": {
             "index": start_index,
@@ -37,8 +38,8 @@ def make_speeds_request(video_id, ball_and_player_tracker: BallAndPlayerTracker,
         if ball_speed_response.status_code != 200:
             raise Exception(f"Failed to make request 'ball_speeds': {ball_speed_response.text}")
         
-    p1_speeds = smooth_speed_data(p1_speeds, alpha=0.3, fps=fps, time_step=speed_time_step)
-    p2_speeds = smooth_speed_data(p2_speeds, alpha=0.3, fps=fps, time_step=speed_time_step)
+    p1_speeds = smooth_speed_data(p1_speeds, alpha=0.3, fps=fps, time_step=speed_time_step, max_speed_kmh=16)
+    p2_speeds = smooth_speed_data(p2_speeds, alpha=0.3, fps=fps, time_step=speed_time_step, max_speed_kmh=16)
     if p1_speeds is not None and p2_speeds is not None:
         player_speed_response = requests.post(base_url+'/ai_analysis/player_speeds', json={
             'video_id': video_id,
@@ -71,9 +72,13 @@ def tracking(
             court_keypoints[3], # BR
             court_keypoints[2], # BL
         ])
+    
+    ball_tracks = []
+    player_tracks = []
 
-    world_tracks = []
-    req_world_tracks = []
+    req_ball_tracks = []
+    req_player_tracks = []
+
     all_polygons = [_get_polygon(court_keypoints) for court_keypoints in all_court_keypoints]
     ball_and_player_tracker.define_trackers_using_polygons(all_polygons[0], video_info["fps"])
 
@@ -83,21 +88,24 @@ def tracking(
         end_index = start_index + chunk_size
 
         frames = read_video_range(video_path, start_index, end_index)
-        wt = ball_and_player_tracker.detect_frames(frames, start_index, all_polygons, update_court_polygon_interval=int(court_keypoints_time_step*video_info["fps"])) 
-        world_tracks.extend(wt)
-        req_world_tracks.extend(wt)
+        bt, pt = ball_and_player_tracker.detect_frames(frames, start_index, all_polygons, update_court_polygon_interval=int(court_keypoints_time_step*video_info["fps"])) 
+        ball_tracks.extend(bt)
+        player_tracks.extend(pt)
+        req_ball_tracks.extend(bt)
+        req_player_tracks.extend(pt)
         if chunk_index % make_request_every_n_chunks == 0 and chunk_index != 0:
             end_index = start_index + len(frames)
-            start_index = end_index-len(req_world_tracks)
-            make_speeds_request(video_id, ball_and_player_tracker, req_world_tracks, start_index, end_index, video_info["fps"], speed_time_step)
-            req_world_tracks = []
+            start_index = end_index-len(req_ball_tracks)
+            make_speeds_request(video_id, ball_and_player_tracker, req_ball_tracks, req_player_tracks, start_index, end_index, video_info["fps"], speed_time_step)
+            req_ball_tracks = []
+            req_player_tracks = []
     
-    if len(req_world_tracks) > 0:
+    if len(req_ball_tracks) > 0:
         end_index = video_info["total_frames"]
-        start_index = end_index - len(req_world_tracks)
-        make_speeds_request(video_id, ball_and_player_tracker, req_world_tracks, start_index, end_index, video_info["fps"], speed_time_step)
+        start_index = end_index - len(req_ball_tracks)
+        make_speeds_request(video_id, ball_and_player_tracker, req_ball_tracks, req_player_tracks, start_index, end_index, video_info["fps"], speed_time_step)
 
-    return ball_and_player_tracker.extract_from_world_tracks(world_tracks)
+    return ball_and_player_tracker.extract_from_world_tracks(req_ball_tracks, req_player_tracks)
 
 
 

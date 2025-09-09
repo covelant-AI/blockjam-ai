@@ -2,9 +2,7 @@ import pandas as pd
 from ai_core.mini_court import MiniCourt
 import numpy as np
 
-<<<<<<< HEAD
-=======
-def smooth_speed_data(speeds:list[float], alpha=0.3, fps=30, time_step=0.5) -> list[float] | None:
+def smooth_speed_data(speeds:list[float], alpha=0.3, fps=30, time_step=0.5, min_speed_kmh=0, max_speed_kmh=200) -> list[float] | None:
     df = pd.DataFrame(speeds, columns=['speed'])
     #check if any of the values are not None
     if not any(speed is not None and not np.isnan(speed) for speed in speeds):
@@ -18,11 +16,11 @@ def smooth_speed_data(speeds:list[float], alpha=0.3, fps=30, time_step=0.5) -> l
         .fillna(method='ffill')
     )
     df['smooth_speed'] = df['smooth_speed'].ewm(alpha=alpha, adjust=False).mean()
+    df['smooth_speed'] = df['smooth_speed'].clip(lower=min_speed_kmh, upper=max_speed_kmh)
     target_times = [i * time_step for i in range(int(len(speeds) / (fps * time_step)) + 1)]
     sampled_indices = [int(t * fps) for t in target_times if int(t * fps) < len(speeds)]
     return df.iloc[sampled_indices]['smooth_speed'].tolist()
 
->>>>>>> 0f3d425 (Update video URL in test_input.json and refactor speed data processing in core.py and tracking.py)
 def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_kmh):
     """
     Generic function to calculate speed data from detections.
@@ -73,7 +71,7 @@ def _calculate_speed_data(detections, fps, time_step, distance_func, max_speed_k
 
         target_times = [i * time_step for i in range(int(len(detections) / (fps * time_step)) + 1)]
         sampled_indices = [int(t * fps) for t in target_times if int(t * fps) < len(detections)]
-        speeds = df.iloc[sampled_indices]['smooth_speed'].tolist()
+        speeds = df.iloc[sampled_indices]['speed'].tolist()
         return speeds
     except Exception as e:
         raise Exception(f"Error in _calculate_speed_data: {e}")

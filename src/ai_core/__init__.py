@@ -5,7 +5,7 @@ from .trackers.core import BallAndPlayerTracker
 
 __all__ = ["BallAndPlayerTracker", "CourtLineDetector", "LETRCourtDetector"]
 
-def initialize_models(ball_and_player_tracker_model_path, court_line_detector_model_path, letr_court_line_detector_model_path):
+def initialize_models(ball_tracker_model_path, player_tracker_model_path, court_line_detector_model_path, letr_court_line_detector_model_path):
     # Import here to avoid circular import
     from schemas.ai import AIModels
     
@@ -40,7 +40,7 @@ def initialize_models(ball_and_player_tracker_model_path, court_line_detector_mo
         
         raise Exception(error_msg)
 
-    ball_and_player_tracker = BallAndPlayerTracker(model_path=ball_and_player_tracker_model_path, device=device)
+    ball_and_player_tracker = BallAndPlayerTracker(ball_model_path=ball_tracker_model_path, player_model_path=player_tracker_model_path, device=device)
     court_line_detector = CourtLineDetector(court_line_detector_model_path, device=device)
     letr_court_line_detector = LETRCourtDetector(letr_court_line_detector_model_path, device=device)
     return AIModels(
