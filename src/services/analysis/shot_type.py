@@ -7,7 +7,7 @@ from utils.video_utils import get_video_info, read_video_range
 
 load_dotenv()
 
-def classify_player_shots(video_id, video_path, sectioned_data:list[SectionedStubsData], shot_type_classifier:ShotTypeClassifier, make_request=False, webhook_path='/ai_analysis/player_detections'):
+def classify_player_shots(video_id, video_path, sectioned_data:list[SectionedStubsData], shot_type_classifier:ShotTypeClassifier, make_request=False, webhook_path='/ai_analysis/classify_shots'):
     video_info = get_video_info(video_path)
     results = []
     error_sections = []
@@ -22,10 +22,12 @@ def classify_player_shots(video_id, video_path, sectioned_data:list[SectionedStu
             p1_bboxes = [pd.get("1", None) for pd in player_detections]
             p2_bboxes = [pd.get("2", None) for pd in player_detections]
             p1_shots = shot_type_classifier.classify(frames, p1_bboxes, flip=True)
-            p1_shots = shot_type_classifier.shot_counter.format_results(video_info['fps'])
             shot_type_classifier.shot_counter.results = []
             p2_shots = shot_type_classifier.classify(frames, p2_bboxes, flip=False)
-            p2_shots = shot_type_classifier.shot_counter.format_results(video_info['fps'])
+
+            p1_shots, p2_shots = shot_type_classifier.shot_counter.fix_results(p1_shots, p2_shots)
+            p1_shots = shot_type_classifier.shot_counter.format_results(p1_shots, video_info['fps'])
+            p2_shots = shot_type_classifier.shot_counter.format_results(p2_shots, video_info['fps'])
             results.append({
                 'section': section,
                 'data': {

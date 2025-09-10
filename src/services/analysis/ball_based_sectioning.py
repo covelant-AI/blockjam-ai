@@ -10,7 +10,7 @@ def get_sections_fram_ball_detections(
         buffer_time_before_section=2,
         buffer_time_after_section=1,
         max_gap_time=1,
-        min_ball_speed_kmh=15,
+        min_ball_speed_kmh=10,
         ):
     print(f"Getting sections from ball detections")
     max_gap_size = max_gap_time * video_info['fps']

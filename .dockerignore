@@ -1,0 +1,16 @@
+.env
+__pycache__
+*.pt
+*.pth
+*.pt.gz
+*.pt.tar.gz
+*.pt.tar.xz
+*.pt.tar.bz2
+*.pt.tar.wim
+.vscode
+/tracker_stubs/
+/input_videos/
+/input_images/
+/output_videos/
+/output_images/
+/old_models/

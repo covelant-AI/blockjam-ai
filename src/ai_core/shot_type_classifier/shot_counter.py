@@ -59,15 +59,27 @@ class ShotCounter:
 
         self.frames_since_last_shot += 1
 
-    def format_results(self, fps):
+    def format_results(self, results, fps):
         formatted_results = []
-        for result in self.results:
+        for result in results:
             formatted_results.append({
                 "index": result["FrameID"],
                 "time": frame_to_time(result["FrameID"], fps),
                 "shot_type": result["Shot"],
             })
         return formatted_results
+    
+    def fix_results(self, results1, results2):
+        first_shot = min(results1[0]["FrameID"], results2[0]["FrameID"])
+
+        #replace any serves after the first shot with forehand
+        for result in results1:
+            if result["FrameID"] > first_shot and result["Shot"] == "serve":
+                result["Shot"] = "forehand"
+        for result in results2:
+            if result["FrameID"] > first_shot and result["Shot"] == "serve":
+                result["Shot"] = "forehand"
+        return results1, results2
 
     def display(self, frame):
         """Display counter"""

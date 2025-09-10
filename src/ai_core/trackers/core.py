@@ -69,8 +69,8 @@ class BallAndPlayerTracker:
         all_player_tracks = []
         all_ball_tracks = []
         for frame_index, frame in enumerate(frames):
-            ball_results = self.ball_model(frame, conf=self.CONF_THRESH, imgsz=(720, 1280))[0]
-            player_results = self.player_model(frame, conf=self.CONF_THRESH, imgsz=640,
+            ball_results = self.ball_model(frame, conf=self.CONF_THRESH, imgsz=(736, 1280), verbose=False)[0]
+            player_results = self.player_model(frame, conf=self.CONF_THRESH, imgsz=640, verbose=False,
                                   classes=[self.PLAYER_CLASS])[0]
 
             global_frame_index = global_start_index + frame_index

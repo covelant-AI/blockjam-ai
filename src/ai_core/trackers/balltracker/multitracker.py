@@ -10,28 +10,16 @@ class TennisBallActiveMultiTracker:
     """
     Multi-hypothesis tennis ball tracker (detection-only; no motion prediction).
 
-    Association:
-      - Mutual-nearest style, ranked by expected-step cost (|dist - speed*dt_eff|)
-      - Direction gating (velocity cosine)
-      - NO IoU rescue (IoU never bypasses distance/speed/dir gates)
-      - Second-chance pass is SPEED-ONLY (no radius expansion; higher speed cap)
+    Key points (unchanged basics):
+      - Mutual-nearest association with expected-step ranking and direction gating.
+      - Additive speed-based search radius (EMA + decay).
+      - Per-frame NMS and anti-duplication.
+      - Lag-aware instantaneous pixel speed using effective Δt across misses.
 
-    Radius policy (additive speed with smoothing/decay):
-      recent_speed_for_radius = smooth_speed_pxps (EMA with decay)  # preferred
-      gate_r = base_search_radius_px + τ * recent_speed_for_radius
-               (capped at speed_gate_add_cap_px if set)
-               × (1 + missed_gate_scale * missed)   # default 0
-               then max(size floor), optional bounce multiplier, then clipped
-
-    NMS:
-      - Per-frame NMS is ENABLED by default (do_nms=True) to cull duplicate detections.
-
-    IoU usage (kept, but NOT for association):
-      - Spawn guard (spawn_block_iou / center distance)
-      - Track merge (merge_tracks_iou / center distance)
-
-    Debug:
-      - `dbg` logs instantaneous vs. smoothed speed and the speed source used.
+    New robustness for world speed:
+      - Compute plane-difference speed (court meters) only when projection is trustworthy.
+      - Guard with local homography Jacobian singular values; otherwise fall back to Jacobian-bound estimate.
+      - Clamp to a physical ceiling. Export speed_mps / speed_kmh / speed_mph for visualizers.
     """
 
     # ------------------------ structs ------------------------
@@ -56,11 +44,15 @@ class TennisBallActiveMultiTracker:
         last_wh: Optional[Tuple[float, float]] = None
         last_conf: float = 0.0
         last_plane: Optional[Tuple[float, float]] = None
-        last_speed_pxps: float = 0.0   # instantaneous step speed used last ingest
-        smooth_speed_pxps: float = 0.0 # EMA/decayed speed for radius/expected-step if enabled
+        last_speed_pxps: float = 0.0      # instantaneous pixel speed
+        smooth_speed_pxps: float = 0.0    # EMA of pixel speed
+        last_step_dt_s: float = 0.0
         missed: int = 0
         age_frames: int = 0
         bounce_cooldown: int = 0
+        # world speeds (m/s)
+        last_speed_mps: float = 0.0
+        smooth_speed_mps: float = 0.0
 
     # ------------------------ factories ------------------------
 
@@ -95,29 +87,28 @@ class TennisBallActiveMultiTracker:
         # Association / gating
         max_missed: int = 10,
         max_speed_px: float = 8000,
-        base_search_radius_px: Optional[float] = 0.04,  # None → 2% diag; <1.0 → fraction of diag; ≥1.0 → px
+        base_search_radius_px: Optional[float] = 0.04,  # None→2% diag; <1→frac of diag; ≥1→px
         dir_cos_min: float = -1.0,
-        # (IoU rescue is disabled in association; kept for compat)
         iou_gate: float = 0.10,
         iou_bypass_speed_gate: bool = False,
-        second_chance_expand: float = 2.0,   # not used for radius
+        second_chance_expand: float = 2.0,
         speed_cap_expand: float = 2.5,
 
         # Bounce / robustness
         gate_size_mult: float = 1.5,
         bounce_cooldown_frames: int = 5,
-        bounce_gate_boost: float = 1.0,         # default 1.0 → no radius growth from bounce
-        bounce_speed_cap_boost: float = 3.0,    # speed cap still grows during bounce
+        bounce_gate_boost: float = 1.0,
+        bounce_speed_cap_boost: float = 3.0,
         dir_cos_min_bounce: float = -1.0,
         vy_flip_min_pxps: float = 200.0,
         airborne_window: int = 7,
         a_min_px2: float = 0.45,
 
-        # Suppression (hard, when speed is KNOWN)
+        # Suppression
         suppress_slow_outside: bool = True,
-        outside_slow_speed_px: float = 40.0,
+        outside_slow_speed_px: float = 30,
         suppress_static_inside: bool = True,
-        inside_static_speed_px: float = 12.0,
+        inside_static_speed_px: float = 10,
         static_inside_multi_only: bool = True,
 
         # Track pool
@@ -125,16 +116,16 @@ class TennisBallActiveMultiTracker:
         spawn_min_conf: float = 0.10,
         replace_margin_pxps: float = 200.0,
 
-        # Per-frame NMS (ON by default)
+        # Per-frame NMS
         do_nms: bool = True,
         nms_iou: float = 0.7,
 
-        # Active selection hysteresis
-        active_min_hold_frames: int = 3,
+        # Active selection
+        active_min_hold_frames: int = 0,
         active_win_margin: float = 0.10,
         active_win_streak: int = 2,
 
-        # Cold-start unknown-speed policy
+        # Cold-start policy
         allow_unknown_inside: bool = True,
         allow_unknown_outside: bool = True,
         unknown_outside_near_margin: float = 0.08,
@@ -148,24 +139,30 @@ class TennisBallActiveMultiTracker:
 
         verbose: bool = False,
 
-        # ---- Debug visualizer knobs ----
+        # Debug visualizer
         enable_debug_vis: bool = False,
         debug_window_name: str = "TBTracker",
         debug_font_scale: float = 0.5,
         debug_thickness: int = 1,
 
-        # ---- Additive speed radius knobs ----
-        speed_gate_add_tau_s: float = 0.1,        # Δr = τ * speed_used_for_radius
-        speed_gate_add_cap_px: Optional[float] = None,  # cap for Δr; None → no cap
-        missed_gate_scale: float = 0.0,             # 0 → disable missed-based radius growth
+        # Additive search radius knobs
+        speed_gate_add_tau_s: float = 0.1,
+        speed_gate_add_cap_px: Optional[float] = None,
+        missed_gate_scale: float = 0.0,
 
-        # ---- Speed smoothing / decay knobs ----
-        use_smoothed_speed_for_radius: bool = True,     # recommended: True
-        expected_step_use_smoothed: bool = True,        # recommended: True
-        speed_ema_alpha: float = 0.35,                  # EMA weight for new measurements
-        speed_ema_delta_cap_pxps: Optional[float] = None,  # cap per-frame change in smoothed speed (px/s)
-        speed_missed_decay: float = 0.95,               # multiply smooth speed by this on each missed frame
-        use_expected_step_cost: bool = True,            # keep expected-step ranking
+        # Smoothing / decay knobs
+        use_smoothed_speed_for_radius: bool = True,
+        expected_step_use_smoothed: bool = True,
+        speed_ema_alpha: float = 0.35,
+        speed_ema_delta_cap_pxps: Optional[float] = None,
+        speed_missed_decay: float = 0.95,
+        use_expected_step_cost: bool = True,
+
+        # --- NEW world-speed guards ---
+        world_speed_max_kmh: float = 300.0,   # hard cap
+        world_speed_guard_ratio: float = 2.0, # acceptance band vs Jacobian bounds
+        world_speed_trust_inflate: float = 0.05,  # trust region margin for plane points
+        jacobian_cond_max: float = 50.0,      # reject plane-diff if local conditioning is awful
     ):
         assert H_img2court.shape == (3, 3), "H_img2court must be 3x3"
         self.H = H_img2court.astype(float)
@@ -189,17 +186,16 @@ class TennisBallActiveMultiTracker:
         else:
             self.base_search_radius_px = (
                 max(8.0, float(base_search_radius_px) * diag)
-                if float(base_search_radius_px) < 1.0
-                else float(base_search_radius_px)
+                if float(base_search_radius_px) < 1.0 else float(base_search_radius_px)
             )
 
         # thresholds
         self.max_missed = int(max_missed)
         self.max_speed_px = float(max_speed_px)
         self.dir_cos_min = float(dir_cos_min)
-        self.iou_gate = float(iou_gate)  # unused in association
-        self.iou_bypass_speed_gate = bool(iou_bypass_speed_gate)  # unused in association
-        self.second_chance_expand = float(second_chance_expand)  # not used for radius
+        self.iou_gate = float(iou_gate)
+        self.iou_bypass_speed_gate = bool(iou_bypass_speed_gate)
+        self.second_chance_expand = float(second_chance_expand)
         self.speed_cap_expand = float(speed_cap_expand)
 
         # bounce / robustness
@@ -212,6 +208,7 @@ class TennisBallActiveMultiTracker:
         self.airborne_window = int(airborne_window)
         self.a_min_px2 = float(a_min_px2)
 
+        # suppression
         self.suppress_slow_outside = bool(suppress_slow_outside)
         self.outside_slow_speed_px = float(outside_slow_speed_px)
         self.suppress_static_inside = bool(suppress_static_inside)
@@ -236,7 +233,7 @@ class TennisBallActiveMultiTracker:
         self._challenger_id: Optional[int] = None
         self._challenger_streak: int = 0
 
-        # cold-start policy
+        # cold-start
         self.allow_unknown_inside = bool(allow_unknown_inside)
         self.allow_unknown_outside = bool(allow_unknown_outside)
         self.unknown_outside_near_margin = float(max(0.0, unknown_outside_near_margin))
@@ -254,7 +251,7 @@ class TennisBallActiveMultiTracker:
         self._prev_det_centers: List[Tuple[float, float]] = []
         self.verbose = bool(verbose)
 
-        # debug-vis state
+        # debug-vis
         self.enable_debug_vis = bool(enable_debug_vis)
         self.debug_window_name = str(debug_window_name)
         self.debug_font_scale = float(debug_font_scale)
@@ -263,20 +260,26 @@ class TennisBallActiveMultiTracker:
             self.H_inv = np.linalg.inv(self.H)
         except np.linalg.LinAlgError:
             self.H_inv = None
-        self._last_debug = None  # (vis_img, debug_dict)
+        self._last_debug = None  # (vis_img, dbg)
 
-        # additive speed radius knobs
+        # additive radius
         self.speed_gate_add_tau_s = float(speed_gate_add_tau_s)
         self.speed_gate_add_cap_px = (None if speed_gate_add_cap_px is None else float(speed_gate_add_cap_px))
         self.missed_gate_scale = float(missed_gate_scale)
 
-        # smoothing/decay knobs
+        # smoothing/decay
         self.use_smoothed_speed_for_radius = bool(use_smoothed_speed_for_radius)
         self.expected_step_use_smoothed = bool(expected_step_use_smoothed)
         self.speed_ema_alpha = float(np.clip(speed_ema_alpha, 0.0, 1.0))
         self.speed_ema_delta_cap_pxps = (None if speed_ema_delta_cap_pxps is None else float(speed_ema_delta_cap_pxps))
         self.speed_missed_decay = float(np.clip(speed_missed_decay, 0.0, 1.0))
         self.use_expected_step_cost = bool(use_expected_step_cost)
+
+        # world speed guard cfg
+        self.world_speed_max_kmh = float(world_speed_max_kmh)
+        self.world_speed_guard_ratio = float(max(1.0, world_speed_guard_ratio))
+        self.world_speed_trust_inflate = float(max(0.0, world_speed_trust_inflate))
+        self.jacobian_cond_max = float(max(1.0, jacobian_cond_max))
 
     # ------------------------ public API ------------------------
 
@@ -287,27 +290,17 @@ class TennisBallActiveMultiTracker:
         return_debug: bool = False,
         show_debug: Optional[bool] = None
     ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Optional[np.ndarray], Dict[str, Any]]]:
-        # --- DEBUG LOG ACCUMULATORS ---
+        # --- debug accumulators ---
         dbg: Dict[str, Any] = {
-            "raw_dets": [],
-            "gated_dets": [],
-            "tracks_snapshot": {},
-            "candidates": [],
-            "assigned_pairs_mutual": [],
-            "assigned_pairs_greedy": [],
-            "assigned_pairs_second": [],
-            "unmatched_det_indices": [],
-            "spawned_tids": [],
-            "merged": [],
-            "killed": [],
-            "active_id": None,
+            "raw_dets": [], "gated_dets": [], "tracks_snapshot": {}, "candidates": [],
+            "assigned_pairs_mutual": [], "assigned_pairs_greedy": [], "assigned_pairs_second": [],
+            "unmatched_det_indices": [], "spawned_tids": [], "merged": [], "killed": [], "active_id": None,
         }
 
         # Parse & project
         dets_all = self._parse_and_project(yolo_dets)
         if self.do_nms and dets_all:
             dets_all = self._nms(dets_all, self.nms_iou)
-
         for d in dets_all:
             dbg["raw_dets"].append((d.bbox_img, float(d.conf)))
 
@@ -323,20 +316,20 @@ class TennisBallActiveMultiTracker:
             if key in raw_map:
                 dbg["gated_dets"].append(raw_map[key])
 
-        # Annotate
+        # Annotate inside
         self._annotate_in_court(dets)
 
-        # Tick down bounce cooldowns
+        # cooldowns
         for t in self.tracks.values():
             if t.bounce_cooldown > 0:
                 t.bounce_cooldown -= 1
 
-        # Association
+        # Association candidates
         T = list(self.tracks.values())
         assigned_tracks: set[int] = set()
         assigned_dets: set[int] = set()
 
-        # Snapshot tracks
+        # Snapshot
         for t in self.tracks.values():
             if t.last_bbox is None:
                 continue
@@ -351,11 +344,13 @@ class TennisBallActiveMultiTracker:
                 "age": int(t.age_frames),
                 "inst_speed_pxps": float(inst_spd),
                 "smooth_speed_pxps": float(t.smooth_speed_pxps),
+                "last_step_dt_s": float(t.last_step_dt_s),
                 "bounce_cooldown": int(t.bounce_cooldown),
                 "in_court": bool(t.last_plane is not None and self._point_in_polygon(t.last_plane, self.poly)),
+                "inst_speed_mps": float(t.last_speed_mps),
+                "smooth_speed_mps": float(t.smooth_speed_mps),
             }
 
-        # Build candidate pairs (NO IoU rescue), using smoothed speed where configured
         candidates = []  # (ti, di, dist, implied_speed, cos, rank_cost)
         per_track_gate_r: Dict[int, float] = {}
 
@@ -375,27 +370,25 @@ class TennisBallActiveMultiTracker:
             speed_for_radius = (t.smooth_speed_pxps if (self.use_smoothed_speed_for_radius and t.smooth_speed_pxps > 0.0)
                                 else inst_speed)
 
-            # ---- additive speed radius formula ----
+            # additive radius
             speed_add = self.speed_gate_add_tau_s * max(0.0, speed_for_radius)
             if self.speed_gate_add_cap_px is not None:
                 speed_add = min(speed_add, self.speed_gate_add_cap_px)
 
             gate_r = self.base_search_radius_px + speed_add
-            gate_r *= (1.0 + self.missed_gate_scale * t.missed)  # set 0.0 for strict speed-only
+            gate_r *= (1.0 + self.missed_gate_scale * t.missed)
             if t.last_wh is not None:
                 gate_r = max(gate_r, self.gate_size_mult * float(np.hypot(*t.last_wh)))
             if t.bounce_cooldown > 0:
                 gate_r *= self.bounce_gate_boost
             gate_r = float(np.clip(gate_r, self.base_search_radius_px, 0.25 * self.diag))
             per_track_gate_r[t.track_id] = gate_r
-            # --------------------------------------
 
             # speed cap for this pass
             speed_cap = self.max_speed_px * (1.0 + 0.15 * t.missed)
             if t.bounce_cooldown > 0:
                 speed_cap *= self.bounce_speed_cap_boost
 
-            # expected step over the effective interval
             dt_eff = max((t.missed + 1) * self.dt, 1e-9)
             speed_for_expected = (t.smooth_speed_pxps if (self.expected_step_use_smoothed and t.smooth_speed_pxps > 0.0)
                                   else inst_speed)
@@ -410,8 +403,6 @@ class TennisBallActiveMultiTracker:
 
                 verdict = "pass"
                 cos_val = None
-
-                # Gates: distance, speed, direction. NO IoU bypass.
                 if dist > gate_r:
                     verdict = f"fail:dist>{gate_r:.1f}"
                 elif implied_speed > speed_cap:
@@ -422,95 +413,72 @@ class TennisBallActiveMultiTracker:
                         if cos_val < dir_cos_min_eff:
                             verdict = f"fail:dir<{dir_cos_min_eff:.2f}"
 
-                # rank cost (kinematic)
                 rank_cost = abs(dist - expected_step)
-
                 if verdict == "pass":
                     candidates.append((ti, di, dist, implied_speed, cos_val, rank_cost))
                     dbg["candidates"].append({
-                        "tid": int(T[ti].track_id),
-                        "det_index": int(di),
-                        "dist": float(dist),
-                        "expected_step": float(expected_step),
-                        "rank_cost": float(rank_cost),
-                        "implied_speed": float(implied_speed),
+                        "tid": int(T[ti].track_id), "det_index": int(di),
+                        "dist": float(dist), "expected_step": float(expected_step),
+                        "rank_cost": float(rank_cost), "implied_speed": float(implied_speed),
                         "cos": None if cos_val is None else float(cos_val),
-                        "gate_r": float(gate_r),
-                        "speed_cap": float(speed_cap),
-                        "inst_speed_pxps": float(inst_speed),
-                        "smooth_speed_pxps": float(t.smooth_speed_pxps),
-                        "speed_for_radius": float(speed_for_radius),
-                        "speed_for_expected": float(speed_for_expected),
+                        "gate_r": float(gate_r), "speed_cap": float(speed_cap),
+                        "inst_speed_pxps": float(inst_speed), "smooth_speed_pxps": float(t.smooth_speed_pxps),
+                        "speed_for_radius": float(speed_for_radius), "speed_for_expected": float(speed_for_expected),
                         "verdict": "pass",
                     })
                 else:
                     dbg["candidates"].append({
-                        "tid": int(T[ti].track_id),
-                        "det_index": int(di),
-                        "dist": float(dist),
-                        "expected_step": float(expected_step),
-                        "rank_cost": None,
-                        "implied_speed": float(implied_speed),
+                        "tid": int(T[ti].track_id), "det_index": int(di),
+                        "dist": float(dist), "expected_step": float(expected_step),
+                        "rank_cost": None, "implied_speed": float(implied_speed),
                         "cos": None if cos_val is None else float(cos_val),
-                        "gate_r": float(gate_r),
-                        "speed_cap": float(speed_cap),
-                        "inst_speed_pxps": float(inst_speed),
-                        "smooth_speed_pxps": float(t.smooth_speed_pxps),
-                        "speed_for_radius": float(speed_for_radius),
-                        "speed_for_expected": float(speed_for_expected),
+                        "gate_r": float(gate_r), "speed_cap": float(speed_cap),
+                        "inst_speed_pxps": float(inst_speed), "smooth_speed_pxps": float(t.smooth_speed_pxps),
+                        "speed_for_radius": float(speed_for_radius), "speed_for_expected": float(speed_for_expected),
                         "verdict": verdict,
                     })
 
-        # Mutual-nearest using rank_cost (fallback to distance if disabled)
+        # Mutual-nearest
         if candidates:
             by_track: Dict[int, Tuple[int, float]] = {}
             by_det: Dict[int, Tuple[int, float]] = {}
-
             for (ti, di, dist, _, _, rank_cost) in candidates:
                 metric = float(rank_cost) if self.use_expected_step_cost else float(dist)
-                if (ti not in by_track) or (metric < by_track[ti][1]):
-                    by_track[ti] = (di, metric)
-                if (di not in by_det) or (metric < by_det[di][1]):
-                    by_det[di] = (ti, metric)
+                if (ti not in by_track) or (metric < by_track[ti][1]): by_track[ti] = (di, metric)
+                if (di not in by_det) or (metric < by_det[di][1]):   by_det[di] = (ti, metric)
 
             mut_pairs = []
             for ti, (di, _) in by_track.items():
                 if di in by_det and by_det[di][0] == ti:
                     for c in candidates:
-                        if c[0] == ti and c[1] == di:
-                            mut_pairs.append(c); break
+                        if c[0] == ti and c[1] == di: mut_pairs.append(c); break
 
             mut_pairs.sort(key=lambda x: (x[5] if self.use_expected_step_cost else x[2]))
             for ti, di, dist, implied_speed, cos_val, rank_cost in mut_pairs:
-                if (T[ti].track_id in assigned_tracks) or (di in assigned_dets):
-                    continue
-                self._ingest(T[ti], dets[di], implied_speed)  # updates smooth speed
-                assigned_tracks.add(T[ti].track_id)
-                assigned_dets.add(di)
-                self._maybe_flag_bounce(T[ti])
-                dbg["assigned_pairs_mutual"].append((int(T[ti].track_id), int(di)))
+                Tti = T[ti]
+                if (Tti.track_id in assigned_tracks) or (di in assigned_dets): continue
+                self._ingest(Tti, dets[di], implied_speed)
+                assigned_tracks.add(Tti.track_id); assigned_dets.add(di)
+                self._maybe_flag_bounce(Tti)
+                dbg["assigned_pairs_mutual"].append((int(Tti.track_id), int(di)))
 
-        # Greedy remainder (same metric)
+        # Greedy remainder
         rem = [c for c in candidates if (T[c[0]].track_id not in assigned_tracks and c[1] not in assigned_dets)]
         rem.sort(key=lambda x: (x[5] if self.use_expected_step_cost else x[2]))
         for ti, di, dist, implied_speed, cos_val, rank_cost in rem:
-            if (T[ti].track_id in assigned_tracks) or (di in assigned_dets):
-                continue
-            self._ingest(T[ti], dets[di], implied_speed)
-            assigned_tracks.add(T[ti].track_id)
-            assigned_dets.add(di)
-            self._maybe_flag_bounce(T[ti])
-            dbg["assigned_pairs_greedy"].append((int(T[ti].track_id), int(di)))
+            Tti = T[ti]
+            if (Tti.track_id in assigned_tracks) or (di in assigned_dets): continue
+            self._ingest(Tti, dets[di], implied_speed)
+            assigned_tracks.add(Tti.track_id); assigned_dets.add(di)
+            self._maybe_flag_bounce(Tti)
+            dbg["assigned_pairs_greedy"].append((int(Tti.track_id), int(di)))
 
-        # Second-chance: SPEED-ONLY (no radius growth)
+        # Second chance (speed-only)
         for ti, t in enumerate(T):
-            if t.track_id in assigned_tracks or t.last_bbox is None or len(t.img_trace) == 0:
-                continue
-
-            gate_r = per_track_gate_r.get(t.track_id, self.base_search_radius_px)  # primary radius
+            if t.track_id in assigned_tracks or t.last_bbox is None or len(t.img_trace) == 0: continue
+            gate_r = per_track_gate_r.get(t.track_id, self.base_search_radius_px)
             speed_cap = self.max_speed_px * self.speed_cap_expand * (1.0 + 0.15 * t.missed)
-            if t.bounce_cooldown > 0:
-                speed_cap *= self.bounce_speed_cap_boost
+            if t.bounce_cooldown > 0: speed_cap *= self.bounce_speed_cap_boost
 
             dt_eff = max((t.missed + 1) * self.dt, 1e-9)
             inst_speed = self._track_speed(t) or 0.0
@@ -521,100 +489,98 @@ class TennisBallActiveMultiTracker:
             best = None
             (px, py) = t.img_trace[-1]
             for di, d in enumerate(dets):
-                if di in assigned_dets:
-                    continue
+                if di in assigned_dets: continue
                 dx, dy = d.cx_img - px, d.cy_img - py
-                dist = float(np.hypot(dx, dy))
-                implied_speed = dist / dt_eff
-
-                # apply gates
-                if dist > gate_r:
-                    continue
-                if implied_speed > speed_cap:
-                    continue
-
+                dist = float(np.hypot(dx, dy)); implied_speed = dist / dt_eff
+                if dist > gate_r or implied_speed > speed_cap: continue
                 rank_cost = abs(dist - expected_step)
-                if (best is None) or ((rank_cost if self.use_expected_step_cost else dist) < (best[2] if self.use_expected_step_cost else best[1])):
+                if (best is None) or ((rank_cost if self.use_expected_step_cost else dist) <
+                                      (best[2] if self.use_expected_step_cost else best[1])):
                     best = (di, dist, rank_cost, implied_speed)
 
             if best is not None:
                 di, dist, rank_cost, implied_speed = best
                 self._ingest(t, dets[di], implied_speed)
-                assigned_tracks.add(t.track_id)
-                assigned_dets.add(di)
+                assigned_tracks.add(t.track_id); assigned_dets.add(di)
                 self._maybe_flag_bounce(t)
                 dbg["assigned_pairs_second"].append((int(t.track_id), int(di)))
 
-        # Age & miss unassigned tracks (+ decay smoothed speed)
+        # Age/decay
         for t in T:
             if t.track_id not in assigned_tracks:
-                t.missed += 1
-                t.age_frames += 1
-                if self.speed_missed_decay < 1.0 and t.smooth_speed_pxps > 0.0:
-                    t.smooth_speed_pxps = float(max(0.0, self.speed_missed_decay * t.smooth_speed_pxps))
+                t.missed += 1; t.age_frames += 1
+                if self.speed_missed_decay < 1.0:
+                    if t.smooth_speed_pxps > 0.0:
+                        t.smooth_speed_pxps = float(max(0.0, self.speed_missed_decay * t.smooth_speed_pxps))
+                    if t.smooth_speed_mps > 0.0:
+                        t.smooth_speed_mps = float(max(0.0, self.speed_missed_decay * t.smooth_speed_mps))
 
-        # Spawn NEW tracks from unmatched detections
-        unmatched_dets = [
-            dets[i] for i in range(len(dets))
-            if i not in assigned_dets and float(dets[i].conf) >= self.spawn_min_conf
-        ]
-        before_tids = set(self.tracks.keys())
+        # Spawn / merge / kill
+        unmatched_dets = [dets[i] for i in range(len(dets))
+                          if i not in assigned_dets and float(dets[i].conf) >= self.spawn_min_conf]
+        before = set(self.tracks.keys())
         self._spawn_from(unmatched_dets)
-        after_tids = set(self.tracks.keys())
-        dbg["spawned_tids"] = [int(tid) for tid in sorted(after_tids - before_tids)]
+        dbg["spawned_tids"] = [int(tid) for tid in sorted(set(self.tracks.keys()) - before)]
 
-        # Merge overlapping/duplicate tracks
         merged_pairs: List[Tuple[int, int]] = []
         if len(self.tracks) >= 2:
             merged_pairs = self._merge_overlapping_tracks()
             dbg["merged"].extend([(int(l), int(s)) for (l, s) in merged_pairs])
 
-        # Kill dead tracks
         dead_ids = [tid for tid, t in self.tracks.items() if t.missed > self.max_missed]
         for tid in dead_ids:
             del self.tracks[tid]
         dbg["killed"].extend(int(tid) for tid in dead_ids)
 
-        # Select fastest valid active track
         active = self._select_active_hysteresis()
         active_id = active.track_id if active else None
         dbg["active_id"] = int(active_id) if active_id is not None else None
 
-        # Update prev detection centers
         self._prev_det_centers = [(d.cx_img, d.cy_img) for d in dets_all]
 
-        # Build output list with is_active
+        # Output
         out: List[Dict[str, Any]] = []
         for tid, t in self.tracks.items():
             bbox = self._clip_bbox(t.last_bbox) if t.last_bbox is not None else None
-            if bbox is None:
-                continue
+            if bbox is None: continue
             cx, cy = self._bbox_center_xyxy(bbox)
             in_court_now = (t.last_plane is not None) and self._point_in_polygon(t.last_plane, self.poly)
             spd_known = (len(t.img_trace) >= 2)
-            inst_spd = self._track_speed(t)
-            if inst_spd is None or not np.isfinite(inst_spd):
-                inst_spd = t.last_speed_pxps if np.isfinite(t.last_speed_pxps) else 0.0
+            inst_spd_px = self._track_speed(t)
+            if inst_spd_px is None or not np.isfinite(inst_spd_px):
+                inst_spd_px = t.last_speed_pxps if np.isfinite(t.last_speed_pxps) else 0.0
+
+            # choose world speed (prefer smoothed)
+            mps_value = t.smooth_speed_mps if t.smooth_speed_mps > 0.0 else (t.last_speed_mps if t.last_speed_mps > 0.0 else None)
+            kmh = (mps_value * 3.6) if (mps_value is not None) else None
+            mph = (mps_value * 2.2369362921) if (mps_value is not None) else None
 
             out.append({
                 "track_id": int(tid),
                 "is_active": bool(tid == active_id),
                 "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
                 "image_center": (float(cx), float(cy)),
-                "image_speed_pxps": float(inst_spd),
+                "image_speed_pxps": float(inst_spd_px),
                 "smooth_speed_pxps": float(t.smooth_speed_pxps),
+                "last_step_dt_s": float(t.last_step_dt_s),
                 "speed_known": bool(spd_known),
                 "in_court": bool(in_court_now),
                 "plane_xy": t.last_plane if (t.last_plane is not None) else (None, None),
+
+                # world speeds for your visualizers
+                # "speed_mps": float(mps_value) if mps_value is not None else None,
+                # "speed_mps_instant": float(t.last_speed_mps) if t.last_speed_mps > 0.0 else None,
+                # "speed_kmh": float(kmh) if kmh is not None else None,
+                # "speed_mph": float(mph) if mph is not None else None,
+
                 "missed": int(t.missed),
-                "age_frames": int(t.age_frames),
+                "age": int(t.age_frames),
                 "conf": float(t.last_conf),
             })
 
         out.sort(key=lambda x: (-int(x["is_active"]), -x["image_speed_pxps"]))
-        dbg["unmatched_det_indices"] = [int(i) for i in range(len(dets)) if i not in assigned_dets]
 
-        # ---- DEBUG RENDERING ----
+        # Debug render
         vis_img: Optional[np.ndarray] = None
         do_show = self.enable_debug_vis if show_debug is None else bool(show_debug)
         if debug_image is not None:
@@ -637,7 +603,7 @@ class TennisBallActiveMultiTracker:
         return_debug: bool = False,
         show_debug: Optional[bool] = None
     ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Optional[np.ndarray], Dict[str, Any]]]:
-        tracks = self.update(yolo_dets, debug_image, return_debug,show_debug)
+        tracks = self.update(yolo_dets, debug_image, return_debug, show_debug)
         active_track = None
         for track in tracks:
             if track["is_active"]:
@@ -660,7 +626,6 @@ class TennisBallActiveMultiTracker:
         W, H = self.image_size
 
         for obj in yolo_dets:
-            # unpack
             if isinstance(obj, dict):
                 box = obj.get("bbox")
                 conf = float(obj.get("conf", 1.0))
@@ -681,10 +646,8 @@ class TennisBallActiveMultiTracker:
 
             if self.det_format == "xywh":
                 cx, cy, w, h = box
-                x1 = cx - w / 2.0
-                y1 = cy - h / 2.0
-                x2 = cx + w / 2.0
-                y2 = cy + h / 2.0
+                x1 = cx - w / 2.0; y1 = cy - h / 2.0
+                x2 = cx + w / 2.0; y2 = cy + h / 2.0
             else:
                 x1, y1, x2, y2 = box
 
@@ -719,10 +682,15 @@ class TennisBallActiveMultiTracker:
     # ---- track lifecycle ----
 
     def _ingest(self, t: Track, d: Detection, implied_speed: float):
+        # effective dt
+        frames_spanned = int(t.missed) + 1
+        dt_eff = max(frames_spanned * self.dt, 1e-9)
+        t.last_step_dt_s = float(dt_eff)
+
         # histories
         t.img_trace.append((d.cx_img, d.cy_img))
         t.age_frames += 1
-        t.missed = 0  # reset on successful association
+        t.missed = 0
 
         # bbox/size smoothing (EMA on size)
         w = d.bbox_img[2] - d.bbox_img[0]
@@ -734,33 +702,98 @@ class TennisBallActiveMultiTracker:
             t.last_wh = (a*float(w) + (1-a)*t.last_wh[0],
                          a*float(h) + (1-a)*t.last_wh[1])
 
-        # keep raw detection bbox
+        # keep raw bbox + conf
         t.last_bbox = d.bbox_img
         t.last_conf = float(d.conf)
 
-        # instantaneous speed for this association (clipped for storage)
+        # instantaneous pixel speed (px/s)
         t.last_speed_pxps = float(np.clip(implied_speed, 0.0, self.max_speed_px * 3.0))
 
-        # --- update smoothed speed (EMA with optional per-step delta cap) ---
-        prev = float(t.smooth_speed_pxps)
-        if prev <= 0.0:
-            sm = t.last_speed_pxps
+        # --- WORLD SPEED (guarded) ---
+        pxps = float(t.last_speed_pxps)
+
+        # Jacobian singular values at previous pixel (for bounds)
+        smin, smax = (None, None)
+        if len(t.img_trace) >= 2:
+            px_prev, py_prev = t.img_trace[-2]
+            smin, smax = self._jacobian_svals(self.H, float(px_prev), float(py_prev))
+        lo_est = smin * pxps if (smin is not None) else None
+        hi_est = smax * pxps if (smax is not None) else None
+
+        # plane-difference candidate (meters/s)
+        mps_plane = None
+        if (t.last_plane is not None) and (d.cx_plane is not None) and (d.cy_plane is not None):
+            du = float(d.cx_plane - t.last_plane[0])
+            dv = float(d.cy_plane - t.last_plane[1])
+            mps_plane = float(np.hypot(du, dv) / dt_eff)
+
+        # trust test: polygon + Jacobian band + conditioning
+        accept_plane = False
+        if (mps_plane is not None) and (lo_est is not None) and (hi_est is not None) and np.isfinite(mps_plane):
+            # inflated trust polygon
+            poly_trust = self._inflate_polygon(self.poly, self.world_speed_trust_inflate) if self.world_speed_trust_inflate > 0 else self.poly
+            prev_in = self._point_in_polygon(t.last_plane, poly_trust) if (t.last_plane is not None) else False
+            curr_in = self._point_in_polygon((d.cx_plane, d.cy_plane), poly_trust)
+            # local conditioning
+            kappa_ok = True
+            if len(t.img_trace) >= 2:
+                px_prev, py_prev = t.img_trace[-2]
+                smin2, smax2 = self._jacobian_svals(self.H, float(px_prev), float(py_prev))
+                if (smin2 is None) or (smax2 is None) or (smax2 / max(smin2, 1e-12) > self.jacobian_cond_max):
+                    kappa_ok = False
+            # guard band
+            R = self.world_speed_guard_ratio
+            lo_guard = max(0.0, lo_est / R)
+            hi_guard = hi_est * R
+            accept_plane = prev_in and curr_in and kappa_ok and (lo_guard <= mps_plane <= hi_guard)
+
+        # choose world speed
+        if accept_plane:
+            inst_mps = mps_plane
+        elif (lo_est is not None) and (hi_est is not None) and np.isfinite(pxps):
+            # bounded fallback: conservative midpoint in [lo, hi]
+            inst_mps = float(np.clip(0.5 * (lo_est + hi_est), lo_est, hi_est))
+        else:
+            inst_mps = 0.0
+
+        # physical clamp
+        max_mps = self.world_speed_max_kmh / 3.6
+        if not np.isfinite(inst_mps) or inst_mps < 0.0:
+            inst_mps = 0.0
+        elif inst_mps > max_mps:
+            inst_mps = max_mps
+
+        t.last_speed_mps = float(inst_mps)
+
+        # smooth pixel speed
+        prev_px = float(t.smooth_speed_pxps)
+        if prev_px <= 0.0:
+            sm_px = t.last_speed_pxps
         else:
             if self.speed_ema_delta_cap_pxps is not None:
-                delta = np.clip(t.last_speed_pxps - prev, -self.speed_ema_delta_cap_pxps, self.speed_ema_delta_cap_pxps)
-                target = prev + delta
+                delta = np.clip(t.last_speed_pxps - prev_px,
+                                -self.speed_ema_delta_cap_pxps, self.speed_ema_delta_cap_pxps)
+                target_px = prev_px + delta
             else:
-                target = t.last_speed_pxps
-            sm = (1.0 - self.speed_ema_alpha) * prev + self.speed_ema_alpha * target
-        t.smooth_speed_pxps = float(np.clip(sm, 0.0, self.max_speed_px * 3.0))
-        # --------------------------------------------------------------------
+                target_px = t.last_speed_pxps
+            sm_px = (1.0 - self.speed_ema_alpha) * prev_px + self.speed_ema_alpha * target_px
+        t.smooth_speed_pxps = float(np.clip(sm_px, 0.0, self.max_speed_px * 3.0))
 
+        # smooth world speed
+        prev_m = float(t.smooth_speed_mps)
+        if prev_m <= 0.0:
+            sm_m = t.last_speed_mps
+        else:
+            sm_m = (1.0 - self.speed_ema_alpha) * prev_m + self.speed_ema_alpha * t.last_speed_mps
+        t.smooth_speed_mps = float(max(0.0, sm_m))
+        # --- end world speed ---
+
+        # update plane AFTER computing speed
         if d.cx_plane is not None and d.cy_plane is not None:
             t.last_plane = (d.cx_plane, d.cy_plane)
             t.plane_trace.append(t.last_plane)
 
     def _maybe_flag_bounce(self, t: Track) -> None:
-        """Detect bounce (vertical vy sign flip and/or strong curvature) and set cooldown."""
         n = len(t.img_trace)
         if n < 3:
             return
@@ -780,7 +813,7 @@ class TennisBallActiveMultiTracker:
         if not dets:
             return
 
-        def min_dist_to_tracks(d: "TennisBallActiveMultiTracker.Detection") -> float:
+        def min_dist_to_tracks(d):
             best = float("inf")
             for t in self.tracks.values():
                 if t.last_bbox is None:
@@ -789,7 +822,7 @@ class TennisBallActiveMultiTracker:
                 best = min(best, float(np.hypot(d.cx_img - tx, d.cy_img - ty)))
             return best
 
-        def min_dist_to_prev(d: "TennisBallActiveMultiTracker.Detection") -> float:
+        def min_dist_to_prev(d):
             if not self._prev_det_centers:
                 return float("inf")
             best = float("inf")
@@ -797,7 +830,7 @@ class TennisBallActiveMultiTracker:
                 best = min(best, float(np.hypot(d.cx_img - px, d.cy_img - py)))
             return best
 
-        def is_dup_of_any_track(d: "TennisBallActiveMultiTracker.Detection") -> bool:
+        def is_dup_of_any_track(d):
             for t in self.tracks.values():
                 if t.last_bbox is None:
                     continue
@@ -823,12 +856,12 @@ class TennisBallActiveMultiTracker:
 
         cand.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-        free_slots = max(0, self.max_tracks - len(self.tracks))
+        free = max(0, self.max_tracks - len(self.tracks))
         to_spawn: List["TennisBallActiveMultiTracker.Detection"] = []
 
         for novelty, conf, d in cand:
-            if free_slots > 0:
-                to_spawn.append(d); free_slots -= 1
+            if free > 0:
+                to_spawn.append(d); free -= 1
             else:
                 worst_tid = self._pick_replacement_target()
                 if worst_tid is None:
@@ -842,8 +875,7 @@ class TennisBallActiveMultiTracker:
                 to_spawn.append(d)
 
         for d in to_spawn:
-            t = self.Track(track_id=self._next_tid)
-            self._next_tid += 1
+            t = self.Track(track_id=self._next_tid); self._next_tid += 1
             t.img_trace.append((d.cx_img, d.cy_img))
             t.last_bbox = d.bbox_img
             t.last_wh = (d.bbox_img[2] - d.bbox_img[0], d.bbox_img[3] - d.bbox_img[1])
@@ -853,10 +885,12 @@ class TennisBallActiveMultiTracker:
                 t.plane_trace.append(t.last_plane)
             t.last_speed_pxps = 0.0
             t.smooth_speed_pxps = 0.0
+            t.last_speed_mps = 0.0
+            t.smooth_speed_mps = 0.0
+            t.last_step_dt_s = float(self.dt)
             self.tracks[t.track_id] = t
 
     def _merge_overlapping_tracks(self) -> List[Tuple[int, int]]:
-        """Remove duplicate tracks that overlap strongly. Returns list of (loser_tid, survivor_tid)."""
         tids = list(self.tracks.keys())
         to_drop: set[int] = set()
         merged_pairs: List[Tuple[int, int]] = []
@@ -895,16 +929,14 @@ class TennisBallActiveMultiTracker:
     def _pick_replacement_target(self) -> Optional[int]:
         if not self.tracks:
             return None
-        worst_tid = None
-        worst_key = None
+        worst_tid, worst_key = None, None
         for tid, t in self.tracks.items():
             key = (t.missed, -t.last_speed_pxps, -t.age_frames)
             if worst_key is None or key > worst_key:
-                worst_key = key
-                worst_tid = tid
+                worst_key = key; worst_tid = tid
         return worst_tid
 
-    # ---- active selection with hysteresis (cold-start aware) ----
+    # ---- active selection with hysteresis (unchanged logic) ----
 
     def _select_active_hysteresis(self) -> Optional[Track]:
         if not self.tracks:
@@ -914,95 +946,73 @@ class TennisBallActiveMultiTracker:
             self._active_hold = 0
             return None
 
-        near_poly = self._inflate_polygon(self.poly, self.unknown_outside_near_margin) if self.unknown_outside_near_margin > 0 else None
+        near_poly = (
+            self._inflate_polygon(self.poly, self.unknown_outside_near_margin)
+            if self.unknown_outside_near_margin > 0 else None
+        )
 
-        inside_count = 0
-        for t in self.tracks.values():
-            if t.last_plane is not None and self._point_in_polygon(t.last_plane, self.poly):
-                inside_count += 1
+        inside_count = sum(
+            1 for t in self.tracks.values()
+            if t.last_plane is not None and self._point_in_polygon(t.last_plane, self.poly)
+        )
+        apply_static_inside = self.suppress_slow_outside and (
+                not self.static_inside_multi_only or inside_count > 1
+        )
 
-        apply_static_inside = self.suppress_static_inside and (not self.static_inside_multi_only or inside_count > 1)
+        def raw_speed(t):
+            s = self._track_speed(t)
+            if s is None or not np.isfinite(s):
+                s = t.last_speed_pxps if np.isfinite(t.last_speed_pxps) else 0.0
+            return float(max(s, 0.0))
 
-        candidates: List[Tuple[int, float, bool]] = []
-
-        for t in self.tracks.values():
-            if t.last_bbox is None:
-                continue
-            spd = self._track_speed(t)
-            if spd is None or not np.isfinite(spd):
-                spd = t.last_speed_pxps if np.isfinite(t.last_speed_pxps) else 0.0
-                is_known = (len(t.img_trace) >= 2)
-            else:
-                is_known = True
-
+        def eligible(t, spd):
             in_court = (t.last_plane is not None) and self._point_in_polygon(t.last_plane, self.poly)
-
-            eligible = False
-            if is_known:
+            known = (len(t.img_trace) >= 2)
+            if known:
                 if in_court and apply_static_inside and (spd < self.inside_static_speed_px):
-                    eligible = False
-                elif (not in_court) and self.suppress_slow_outside and (spd < self.outside_slow_speed_px):
-                    eligible = False
-                else:
-                    eligible = True
+                    return False
+                if (not in_court) and self.suppress_slow_outside and (spd < self.outside_slow_speed_px):
+                    return False
+                return True
             else:
                 if in_court and self.allow_unknown_inside:
-                    eligible = True
-                elif (not in_court) and self.allow_unknown_outside and near_poly is not None and t.last_plane is not None:
+                    return True
+                if (not in_court) and self.allow_unknown_outside and near_poly is not None and t.last_plane is not None:
                     if self._point_in_polygon(t.last_plane, near_poly) and float(t.last_conf) >= self.unknown_outside_min_conf:
-                        eligible = True
+                        return True
+                return False
 
-            if eligible:
-                candidates.append((t.track_id, float(spd if np.isfinite(spd) else 0.0), bool(is_known)))
+        observed = []
+        for t in self.tracks.values():
+            if t.last_bbox is None or t.missed > 0:
+                continue
+            spd = raw_speed(t)
+            if eligible(t, spd):
+                observed.append((t.track_id, spd, (len(t.img_trace) >= 2)))
 
-        if not candidates:
-            self._active_id = None
+        if self._active_id is not None:
+            inc = self.tracks.get(self._active_id)
+            if inc is not None and inc.missed == 0 and inc.last_bbox is not None:
+                spd_inc = raw_speed(inc)
+                if eligible(inc, spd_inc):
+                    return inc
+
+        strong = [c for c in observed if c[2]]
+        if strong:
+            strong.sort(key=lambda x: x[1], reverse=True)
+            self._active_id = strong[0][0]
             self._active_hold = 0
             self._challenger_id = None
             self._challenger_streak = 0
-            return None
-
-        candidates.sort(key=lambda x: (1 if x[2] else 0, x[1]), reverse=True)
-        best_tid, best_spd, _ = candidates[0]
-
-        if self._active_id is None or self._active_id not in self.tracks:
-            self._active_id = best_tid
-            self._active_hold = self.active_min_hold_frames
-            self._challenger_id = None
-            self._challenger_streak = 0
             return self.tracks[self._active_id]
 
-        cur = self.tracks[self._active_id]
-        cur_spd = self._track_speed(cur)
-        if cur_spd is None or not np.isfinite(cur_spd):
-            cur_spd = cur.last_speed_pxps if np.isfinite(cur.last_speed_pxps) else 0.0
-
-        if best_tid == self._active_id:
-            self._active_hold = max(self._active_hold - 1, 0)
-            self._challenger_id = None
-            self._challenger_streak = 0
-            return cur
-
-        faster = best_spd > (1.0 + self.active_win_margin) * max(cur_spd, 1e-6)
-        if faster:
-            if self._challenger_id == best_tid:
-                self._challenger_streak += 1
-            else:
-                self._challenger_id = best_tid
-                self._challenger_streak = 1
-        else:
-            self._challenger_id = None
-            self._challenger_streak = 0
-
-        if (self._active_hold == 0) and faster and (self._challenger_streak >= self.active_win_streak):
-            self._active_id = best_tid
-            self._active_hold = self.active_min_hold_frames
-            self._challenger_id = None
-            self._challenger_streak = 0
+        if self._active_id is not None and self._active_id in self.tracks:
             return self.tracks[self._active_id]
-        else:
-            self._active_hold = max(self._active_hold - 1, 0)
-            return cur
+
+        self._active_hold = 0
+        self._challenger_id = None
+        self._challenger_streak = 0
+        return None
 
     # ------------------------ helpers ------------------------
 
@@ -1011,7 +1021,9 @@ class TennisBallActiveMultiTracker:
             return None
         (x1, y1) = t.img_trace[-1]
         (x0, y0) = t.img_trace[-2]
-        return float(np.hypot(x1 - x0, y1 - y0) / max(self.dt, 1e-9))
+        dist = float(np.hypot(x1 - x0, y1 - y0))
+        dt_eff = float(t.last_step_dt_s) if getattr(t, "last_step_dt_s", 0.0) > 0.0 else self.dt
+        return float(dist / max(dt_eff, 1e-9))
 
     @staticmethod
     def _warp_poly_img2plane(poly_img: List[Tuple[float, float]], H_img2court: np.ndarray) -> List[Tuple[float, float]]:
@@ -1080,15 +1092,12 @@ class TennisBallActiveMultiTracker:
             return None
         W, H = self.image_size
         x1, y1, x2, y2 = b
-        x1 = max(0.0, min(W - 1.0, x1))
-        x2 = max(0.0, min(W - 1.0, x2))
-        y1 = max(0.0, min(H - 1.0, y1))
-        y2 = max(0.0, min(H - 1.0, y2))
+        x1 = max(0.0, min(W - 1.0, x1)); x2 = max(0.0, min(W - 1.0, x2))
+        y1 = max(0.0, min(H - 1.0, y1)); y2 = max(0.0, min(H - 1.0, y2))
         if x2 <= x1 or y2 <= y1:
             return None
         return (x1, y1, x2, y2)
 
-    # ---- math helpers ----
     def _parabolic_ay_y(self, img_trace: List[Tuple[float, float]], window: int) -> Optional[float]:
         if len(img_trace) < max(4, window):
             return None
@@ -1101,8 +1110,6 @@ class TennisBallActiveMultiTracker:
             return float(coeffs[0])
         except np.linalg.LinAlgError:
             return None
-
-    # ------------------------ NMS ------------------------
 
     def _nms(self, dets: List[Detection], iou_thr: float) -> List[Detection]:
         if not dets:
@@ -1120,8 +1127,6 @@ class TennisBallActiveMultiTracker:
             dets_sorted = rest
         return keep
 
-    # ------------------------ debug rendering ------------------------
-
     def _render_debug(self, img: np.ndarray,
                       dets_all: List["TennisBallActiveMultiTracker.Detection"],
                       dets_gated: List["TennisBallActiveMultiTracker.Detection"],
@@ -1131,43 +1136,39 @@ class TennisBallActiveMultiTracker:
             img = cv2.resize(img, self.image_size, interpolation=cv2.INTER_LINEAR)
             H, W = img.shape[:2]
 
-        # Court polygon
         if getattr(self, "H_inv", None) is not None and self.H_inv is not None:
             poly_pts = self._warp_poly_plane2img(self.poly, self.H_inv)
             if len(poly_pts) >= 3:
-                cv2.polylines(img, [np.int32(poly_pts)], isClosed=True, color=(200, 200, 200), thickness=1, lineType=cv2.LINE_AA)
+                cv2.polylines(img, [np.int32(poly_pts)], True, (200, 200, 200), 1, cv2.LINE_AA)
 
-        # Raw vs gated detections
         raw_set = { (tuple(map(float, bb)), float(c)) for (bb, c) in dbg["raw_dets"] }
-        gated_keys = set()
-        for d in dets_gated:
-            gated_keys.add((tuple(map(float, d.bbox_img)), float(d.conf)))
+        gated_keys = { (tuple(map(float, d.bbox_img)), float(d.conf)) for d in dets_gated }
         for (bb, conf) in raw_set:
             x1, y1, x2, y2 = map(int, bb)
             col = (160, 160, 160) if (bb, conf) not in gated_keys else (230, 230, 230)
             cv2.rectangle(img, (x1, y1), (x2, y2), col, 1, cv2.LINE_AA)
 
-        # Tracks, traces, labels, and (additive) search radius circles
         for tid, t in self.tracks.items():
             color = self._color_for_id(tid)
             if len(t.img_trace) >= 2:
                 pts = np.int32([(int(x), int(y)) for (x, y) in t.img_trace])
-                cv2.polylines(img, [pts], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
+                cv2.polylines(img, [pts], False, color, 2, cv2.LINE_AA)
             if t.last_bbox is not None:
                 x1, y1, x2, y2 = map(int, t.last_bbox)
                 thick = 3 if (dbg["active_id"] is not None and tid == dbg["active_id"]) else 2
                 cv2.rectangle(img, (x1, y1), (x2, y2), color, thick, cv2.LINE_AA)
 
-            inst_spd = self._track_speed(t)
-            if inst_spd is None or not np.isfinite(inst_spd):
-                inst_spd = t.last_speed_pxps if np.isfinite(t.last_speed_pxps) else 0.0
-            label = f"T{tid} v={inst_spd:.0f} s={t.smooth_speed_pxps:.0f} m={t.missed} cd={t.bounce_cooldown}"
+            inst_spd_px = self._track_speed(t)
+            if inst_spd_px is None or not np.isfinite(inst_spd_px):
+                inst_spd_px = t.last_speed_pxps if np.isfinite(t.last_speed_pxps) else 0.0
+            kmh_dbg = t.smooth_speed_mps * 3.6 if t.smooth_speed_mps > 0.0 else (t.last_speed_mps * 3.6 if t.last_speed_mps > 0.0 else 0.0)
+            label = f"T{tid} vpx={inst_spd_px:.1f} spx={t.smooth_speed_pxps:.1f} mps={t.last_speed_mps:.2f} sm_mps={t.smooth_speed_mps:.2f} ({kmh_dbg:.1f} km/h) dt={t.last_step_dt_s:.2f}s"
             pos = (int(t.img_trace[-1][0]) + 6, int(t.img_trace[-1][1]) - 6) if len(t.img_trace) else (x1, y1 - 6)
             self._text(img, label, pos, color)
 
-            # recompute additive radius for visualization with smoothed speed (if enabled)
+            # visualize gate radius
             speed_for_radius = (t.smooth_speed_pxps if (self.use_smoothed_speed_for_radius and t.smooth_speed_pxps > 0.0)
-                                else inst_spd)
+                                else inst_spd_px)
             speed_add = self.speed_gate_add_tau_s * max(0.0, speed_for_radius)
             if self.speed_gate_add_cap_px is not None:
                 speed_add = min(speed_add, self.speed_gate_add_cap_px)
@@ -1182,7 +1183,7 @@ class TennisBallActiveMultiTracker:
                 cx, cy = t.img_trace[-1]
                 cv2.circle(img, (int(cx), int(cy)), int(gate_r), color, 1, cv2.LINE_AA)
 
-        # Assignment arrows + tags
+        # assignment arrows
         for (pair_list, tag) in [
             (dbg["assigned_pairs_mutual"], "mutual"),
             (dbg["assigned_pairs_greedy"], "greedy"),
@@ -1191,45 +1192,31 @@ class TennisBallActiveMultiTracker:
             for tid, di in pair_list:
                 if di < 0 or di >= len(dets_gated):
                     continue
-                d = dets_gated[di]
-                cx, cy = d.cx_img, d.cy_img
+                d = dets_gated[di]; cx, cy = d.cx_img, d.cy_img
                 t = self.tracks.get(tid, None)
                 if t is None or not len(t.img_trace):
                     continue
                 tx, ty = t.img_trace[-1]
                 color = self._color_for_id(tid)
                 cv2.arrowedLine(img, (int(tx), int(ty)), (int(cx), int(cy)), color, 2, cv2.LINE_AA, tipLength=0.2)
-                txt = f"T{tid} {tag}"
-                self._text(img, txt, (int(cx) + 8, int(cy) + 14), color)
+                self._text(img, f"T{tid} {tag}", (int(cx) + 8, int(cy) + 14), color)
 
-        # Unmatched detections with dominant fail reason
         for gi in dbg["unmatched_det_indices"]:
             if gi < 0 or gi >= len(dets_gated):
                 continue
-            d = dets_gated[gi]
-            x1, y1, x2, y2 = map(int, d.bbox_img)
+            d = dets_gated[gi]; x1, y1, x2, y2 = map(int, d.bbox_img)
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 140, 255), 2, cv2.LINE_AA)
-            best = None
-            for c in dbg["candidates"]:
-                if c["det_index"] == gi and isinstance(c["verdict"], str) and c["verdict"].startswith("fail"):
-                    if (best is None) or (c["dist"] < best["dist"]):
-                        best = c
-            label = "UNMATCHED"
-            if best is not None:
-                label += f" [{best['verdict']}]"
-            self._text(img, label, (x1, max(12, y1 - 6)), (0, 140, 255))
-
+            self._text(img, "UNMATCHED", (x1, max(12, y1 - 6)), (0, 140, 255))
         return img
 
     def _text(self, img: np.ndarray, text: str, org: Tuple[int, int], color: Tuple[int, int, int] = (255, 255, 255)):
-        fs = self.debug_font_scale
-        th = max(1, self.debug_thickness)
+        fs = self.debug_font_scale; th = max(1, self.debug_thickness)
         cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 2, cv2.LINE_AA)
         cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, fs, color, th, cv2.LINE_AA)
 
     def _color_for_id(self, tid: int) -> Tuple[int, int, int]:
         rng = np.random.RandomState(tid * 9973 + 123)
-        return tuple(int(x) for x in rng.randint(64, 256, size=3))  # B,G,R
+        return tuple(int(x) for x in rng.randint(64, 256, size=3))
 
     @staticmethod
     def _warp_poly_plane2img(poly_plane: List[Tuple[float, float]], H_inv: np.ndarray) -> List[Tuple[int, int]]:
@@ -1241,3 +1228,27 @@ class TennisBallActiveMultiTracker:
                 xi, yi = float(w[0] / w[2]), float(w[1] / w[2])
                 out.append((int(round(xi)), int(round(yi))))
         return out
+
+    # --- Jacobian helper (meters per pixel singular values at (x,y)) ---
+    @staticmethod
+    def _jacobian_svals(H: np.ndarray, x: float, y: float) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Return (smin, smax) singular values of d(u,v)/d(x,y) at pixel (x,y).
+        Units: meters per pixel. Use to bound px→meter velocity.
+        """
+        h11,h12,h13, h21,h22,h23, h31,h32,h33 = H.flatten()
+        w  = h31*x + h32*y + h33
+        if not np.isfinite(w) or abs(w) < 1e-9:
+            return None, None
+        u  = (h11*x + h12*y + h13) / w
+        v  = (h21*x + h22*y + h23) / w
+        J = (1.0 / w) * np.array([
+            [h11 - h31*u,  h12 - h32*u],
+            [h21 - h31*v,  h22 - h32*v],
+        ], dtype=float)
+        try:
+            svals = np.linalg.svd(J, compute_uv=False)
+            smin, smax = float(np.min(svals)), float(np.max(svals))
+            return (smin, smax)
+        except np.linalg.LinAlgError:
+            return None, None

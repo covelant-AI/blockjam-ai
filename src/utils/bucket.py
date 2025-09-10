@@ -42,7 +42,7 @@ def download_file_from_firebase(url, output_path):
     except Exception as e:
         raise Exception(f"Failed to download and convert video: {str(e)}")
 
-def convert_video_to_standard(input_path, output_path, target_resolution=(1280, 720), target_fps=25):
+def convert_video_to_standard(input_path, output_path, target_resolution=(1280, 720), target_fps=30):
     """
     Convert video to target resolution and fps using FFmpeg with progress bar.
     """

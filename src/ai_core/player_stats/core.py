@@ -11,11 +11,11 @@ def smooth_speed_data(speeds:list[float], alpha=0.3, fps=30, time_step=0.5, min_
     df['smooth_speed'] = (
         df['speed']
         .rolling(window=window_size, center=True, min_periods=1)
-        .quantile(0.9)
+        .mean()
         .fillna(method='bfill')
         .fillna(method='ffill')
     )
-    df['smooth_speed'] = df['smooth_speed'].ewm(alpha=alpha, adjust=False).mean()
+    # df['smooth_speed'] = df['smooth_speed'].ewm(alpha=alpha, adjust=False).mean()
     df['smooth_speed'] = df['smooth_speed'].clip(lower=min_speed_kmh, upper=max_speed_kmh)
     target_times = [i * time_step for i in range(int(len(speeds) / (fps * time_step)) + 1)]
     sampled_indices = [int(t * fps) for t in target_times if int(t * fps) < len(speeds)]

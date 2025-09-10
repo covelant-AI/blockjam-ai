@@ -18,3 +18,5 @@ scikit-learn==1.7.1
 networkx==3.5
 shapely==2.1.1
 tensorflow==2.18.1
+gunicorn>=21.2.0
+lap>=0.5.12

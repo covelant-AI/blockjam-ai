@@ -20,6 +20,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code (models will be mounted at runtime)
 COPY . .
 
+#Remove models directory
+RUN rm -rf models
+
 # Make directories
 RUN mkdir -p tracker_stubs input_videos output_videos output_images
 

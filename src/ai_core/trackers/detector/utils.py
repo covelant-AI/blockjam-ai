@@ -1,9 +1,9 @@
 import numpy as np
 from .data import SimplifiedResults
 
-def filter_yolo_results(results, target_class, topn=None, names=None):
+def filter_yolo_results(results, target_class, topn=None, names=None, min_conf=None):
     """
-    Filter YOLO detections by class with optional top-N by confidence.
+    Filter YOLO detections by class with optional top-N and minimum confidence.
 
     Parameters
     ----------
@@ -14,12 +14,14 @@ def filter_yolo_results(results, target_class, topn=None, names=None):
     target_class : int | str
         Class id or class name to keep.
     topn : int | None
-        If given, return only the top-N detections by confidence.
+        If given, return only the top-N detections by confidence (after filtering).
     names : dict | list | tuple | None
         Optional class-name map. Accepts:
         - dict id->name or name->id
         - list/tuple of names (index = id)
         If omitted, tries `results.names` when available.
+    min_conf : float | None
+        If given, drop detections with confidence < min_conf (after class filtering).
 
     Returns
     -------
@@ -108,6 +110,7 @@ def filter_yolo_results(results, target_class, topn=None, names=None):
     det = detections
     if det.size == 0:
         return []
+
     # Heuristic to locate conf/cls columns. Default [x1,y1,x2,y2,conf,cls].
     conf_col, cls_col = 4, 5
     # If the presumed confidence column is not in [0,1], try the last two columns.
@@ -117,9 +120,15 @@ def filter_yolo_results(results, target_class, topn=None, names=None):
     # Filter by class id
     keep_mask = det[:, cls_col] == cls_id
     det = det[keep_mask]
-
     if det.size == 0:
         return []
+
+    # Optional: minimum confidence threshold
+    if min_conf is not None:
+        thr = float(min_conf)
+        det = det[det[:, conf_col] >= thr]
+        if det.size == 0:
+            return []
 
     # Sort by confidence descending
     order = np.argsort(-det[:, conf_col])

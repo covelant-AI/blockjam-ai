@@ -8,8 +8,8 @@ import os
 import numpy as np
 import pickle
 
-def make_speeds_request(video_id, ball_and_player_tracker: BallAndPlayerTracker, req_ball_tracks, req_player_tracks, start_index, end_index, fps, speed_time_step):
-    ball_detections, ball_speeds, p1_detections, p1_speeds, p2_detections, p2_speeds = ball_and_player_tracker.extract_from_world_tracks(req_ball_tracks, req_player_tracks)
+def make_speeds_request(video_id, ball_speeds, p1_speeds, p2_speeds, start_index, end_index, fps, speed_time_step):
+    # ball_detections, ball_speeds, p1_detections, p1_speeds, p2_detections, p2_speeds = ball_and_player_tracker.extract_from_world_tracks(req_ball_tracks, req_player_tracks)
     section = {
         "start": {
             "index": start_index,
@@ -62,7 +62,7 @@ def tracking(
         video_info,
         chunk_size=1000,
         make_request_every_n_chunks=10,
-        speed_time_step=0.5
+        speed_time_step=1
     ) -> tuple[list[tuple[float, float]], list[float], list[tuple[float, float]], list[float], list[tuple[float, float]], list[float]]:
 
     def _get_polygon(court_keypoints):
@@ -76,8 +76,8 @@ def tracking(
     ball_tracks = []
     player_tracks = []
 
-    req_ball_tracks = []
-    req_player_tracks = []
+    # req_ball_tracks = []
+    # req_player_tracks = []
 
     all_polygons = [_get_polygon(court_keypoints) for court_keypoints in all_court_keypoints]
     ball_and_player_tracker.define_trackers_using_polygons(all_polygons[0], video_info["fps"])
@@ -91,21 +91,21 @@ def tracking(
         bt, pt = ball_and_player_tracker.detect_frames(frames, start_index, all_polygons, update_court_polygon_interval=int(court_keypoints_time_step*video_info["fps"])) 
         ball_tracks.extend(bt)
         player_tracks.extend(pt)
-        req_ball_tracks.extend(bt)
-        req_player_tracks.extend(pt)
-        if chunk_index % make_request_every_n_chunks == 0 and chunk_index != 0:
-            end_index = start_index + len(frames)
-            start_index = end_index-len(req_ball_tracks)
-            make_speeds_request(video_id, ball_and_player_tracker, req_ball_tracks, req_player_tracks, start_index, end_index, video_info["fps"], speed_time_step)
-            req_ball_tracks = []
-            req_player_tracks = []
+        # req_ball_tracks.extend(bt)
+        # req_player_tracks.extend(pt)
+        # if chunk_index % make_request_every_n_chunks == 0 and chunk_index != 0:
+        #     end_index = start_index + len(frames)
+        #     start_index = end_index-len(req_ball_tracks)
+        #     make_speeds_request(video_id, ball_and_player_tracker, req_ball_tracks, req_player_tracks, start_index, end_index, video_info["fps"], speed_time_step)
+        #     req_ball_tracks = []
+        #     req_player_tracks = []
     
-    if len(req_ball_tracks) > 0:
-        end_index = video_info["total_frames"]
-        start_index = end_index - len(req_ball_tracks)
-        make_speeds_request(video_id, ball_and_player_tracker, req_ball_tracks, req_player_tracks, start_index, end_index, video_info["fps"], speed_time_step)
+    # if len(req_ball_tracks) > 0:
+    #     end_index = video_info["total_frames"]
+    #     start_index = end_index - len(req_ball_tracks)
+    #     make_speeds_request(video_id, ball_and_player_tracker, req_ball_tracks, req_player_tracks, start_index, end_index, video_info["fps"], speed_time_step)
 
-    return ball_and_player_tracker.extract_from_world_tracks(req_ball_tracks, req_player_tracks)
+    return ball_and_player_tracker.extract_from_world_tracks(ball_tracks, player_tracks)
 
 
 

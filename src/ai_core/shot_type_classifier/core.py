@@ -3,10 +3,13 @@ from .shot_counter import ShotCounter
 import numpy as np
 import torch
 from .model_architecture import GRUModel
+from scipy.signal import find_peaks
 
 class ShotTypeClassifier:
     def __init__(self, model_path: str, pose_extractor_model_path: str, device):
         self.NB_IMAGES = 30
+        self.MIN_FRAMES_BETWEEN_SHOTS = 60
+
         try:
             self.model = GRUModel(model_path, device=device)
             print("Successfully loaded model")

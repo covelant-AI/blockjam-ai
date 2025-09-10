@@ -13,7 +13,7 @@ def player_speed_for_section(
         mini_court: MiniCourt,
         video_path=None,
         video_info=None,
-        time_step=0.5,
+        time_step=0.25,
         make_request=False,
         webhook_path='/ai_analysis/player_speeds'
         ) -> tuple[list[PlayerSpeedsForSections], list[PlayerSpeedsForSections]]:

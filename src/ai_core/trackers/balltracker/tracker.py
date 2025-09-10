@@ -195,6 +195,11 @@ class TennisBallActiveTracker:
 
     # ------------------------ public API ------------------------
 
+    def update_polygon(self, court_poly_px):
+        court_poly_px = np.asarray(court_poly_px, dtype=np.float32)
+        assert court_poly_px.ndim == 2 and court_poly_px.shape[1] == 2, "court_poly_px must be Nx2"
+        self.court_poly_px = court_poly_px
+
     def update(self, yolo_dets: List[Union[Dict[str, Any], Tuple]]) -> Optional[Dict[str, Any]]:
         """
         yolo_dets items can be:

@@ -4,7 +4,7 @@ import time
 from .court_keypoints import court_keypoints_by_time_step
 from ai_core.court_line_detector import CourtLineDetector
 from ai_core.letr_court_line_detector import LETRCourtDetector
-from .tracking import tracking
+from .tracking import tracking, make_speeds_request
 from ai_core.trackers.core import BallAndPlayerTracker
 from .ball_based_sectioning import get_sections_fram_ball_detections
 import requests
@@ -16,6 +16,7 @@ def analyze_video(
         ball_and_player_tracker: BallAndPlayerTracker,
         court_line_detector: CourtLineDetector,
         letr_court_line_detector: LETRCourtDetector,
+        speed_time_step=0.5,
         ):
     video_info = get_video_info(video_path)
     timing_results = {}
@@ -36,5 +37,7 @@ def analyze_video(
     })
     if section_response.status_code != 200:
         raise Exception(f"Failed to make request 'sections': {section_response.text}")
+
+    make_speeds_request(video_id, ball_speeds, p1_speeds, p2_speeds, 0, video_info["total_frames"], video_info["fps"], speed_time_step)
 
     return timing_results
