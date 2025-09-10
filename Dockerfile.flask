@@ -1,0 +1,48 @@
+FROM python:3.11.1-slim
+
+# Install system dependencies for OpenCV
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy and install requirements
+COPY requirements.txt .
+# RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
+
+
+# Copy source code
+COPY . .
+
+# Make directories
+RUN mkdir -p tracker_stubs input_videos output_videos output_images
+
+# Create non-root user for security
+RUN useradd --create-home --shell /bin/bash app && \
+    chown -R app:app /app
+USER app
+
+# Set environment variables
+ENV HOST=0.0.0.0
+ENV PORT=5000
+ENV DEBUG=False
+ENV PYTHONPATH=/app/src
+
+# Expose port
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Command to run when the container starts (using gunicorn for production)
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "0", "--keep-alive", "2", "--max-requests", "1000", "--max-requests-jitter", "100", "flask_server:app"]
